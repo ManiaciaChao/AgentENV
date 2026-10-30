@@ -886,7 +886,7 @@ fn asynchronous_publication_protects_frozen_root_during_next_writeback() -> Resu
     // Gate either barrier. Fail the barrier or the subsequent superblock write,
     // including a short write; preserve exact confirmed roots under crash cuts.
     for phase in [1, 2] {
-        for failure in [0, 1, 2] {
+        for failure in [0, 1, 2, 3] {
             if phase == 2 && failure == 2 {
                 continue;
             }
@@ -909,6 +909,12 @@ fn asynchronous_publication_protects_frozen_root_during_next_writeback() -> Resu
             core.begin_commit(wake)?;
             notification.recv_timeout(std::time::Duration::from_secs(3))?;
             let frozen = core.view();
+            if failure == 3 {
+                let mut state = disk.disk.0.lock().unwrap();
+                state.fail = Some(state.ops + 1);
+                state.short_write = true;
+                state.errno = libc::EIO;
+            }
             let progress = (|| -> Result<()> {
                 core.stage(0, Box::new([3; PAGE]))?;
                 core.stage(1, Box::new([0; PAGE]))?;
@@ -920,7 +926,7 @@ fn asynchronous_publication_protects_frozen_root_during_next_writeback() -> Resu
                 anyhow::ensure!(frozen.read(0)?.unwrap()[0] == 2, "frozen root mismatch");
                 Ok(())
             })();
-            if failure != 0 {
+            if failure == 1 || failure == 2 {
                 let mut state = disk.disk.0.lock().unwrap();
                 state.fail = Some(state.ops + failure);
                 state.short_write = true;
@@ -928,8 +934,13 @@ fn asynchronous_publication_protects_frozen_root_during_next_writeback() -> Resu
             }
             *disk.released.lock().unwrap() = true;
             disk.ready.notify_all();
-            progress?;
-            assert_eq!(core.finish_publication(true).is_ok(), failure == 0);
+            if failure == 3 {
+                assert!(progress.is_err());
+            } else {
+                progress?;
+            }
+            let published = failure == 0 || failure == 3;
+            assert_eq!(core.finish_publication(true).is_ok(), published);
             if failure != 0 {
                 assert!(core.stage(2, Box::new([4; PAGE])).is_err());
             }
@@ -940,7 +951,7 @@ fn asynchronous_publication_protects_frozen_root_during_next_writeback() -> Resu
                     crashed.cut(mask, torn);
                     let recovered = Core::open(crashed, Policy::default())?;
                     let value = recovered.read_block(0)?.unwrap()[0];
-                    if failure == 0 {
+                    if published {
                         assert_eq!(value, 2);
                     } else {
                         assert!(value == 1 || value == 2);
