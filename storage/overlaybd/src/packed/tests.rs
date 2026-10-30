@@ -557,7 +557,11 @@ async fn slow_durable_barrier_does_not_hold_foreground_io_lock() -> Result<()> {
         released: Mutex::new(false),
         ready: Condvar::new(),
     });
-    let core = Core::create(disk.clone(), PAGE as u64 * 16, Policy::default())?;
+    let core = Core::create(
+        disk.clone(),
+        (super::core::DIRTY_LIMIT * 3) as u64,
+        Policy::default(),
+    )?;
     let upper = PackedUpper::from_core(core)?;
     upper.write_at(0, &[7; PAGE]).await?;
     disk.hold.store(true, Ordering::Release);
@@ -566,8 +570,12 @@ async fn slow_durable_barrier_does_not_hold_foreground_io_lock() -> Result<()> {
         tokio::spawn(async move { upper.sync().await })
     };
     disk.entered.notified().await;
-    let progress = tokio::time::timeout(std::time::Duration::from_millis(250), async {
-        upper.write_at(PAGE as u64, &[9; PAGE]).await?;
+    let progress = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        // Exceed the entire plaintext budget while the first barrier is held.
+        // This requires actual next-generation writeback, not just buffering.
+        upper
+            .write_at(PAGE as u64, &vec![9; super::core::DIRTY_LIMIT * 2])
+            .await?;
         assert_eq!(upper.read_at(0, PAGE).await?.as_ref(), &[7; PAGE]);
         anyhow::Ok(())
     })
@@ -827,6 +835,130 @@ fn deferred_metadata_merges_shared_objects_overwrites_and_zeroes() -> Result<()>
     let core = Core::open(disk, policy(Codec::None, false))?;
     for (lba, value) in expected.into_iter().enumerate() {
         assert_eq!(*core.read_block(lba as u64)?.unwrap(), [value; PAGE]);
+    }
+    Ok(())
+}
+
+#[test]
+fn asynchronous_publication_protects_frozen_root_during_next_writeback() -> Result<()> {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Condvar,
+    };
+    struct Gated {
+        disk: Model,
+        remaining: AtomicUsize,
+        entered: mpsc::Sender<()>,
+        released: Mutex<bool>,
+        ready: Condvar,
+    }
+    impl Disk for Gated {
+        fn read(&self, o: u64, b: &mut [u8]) -> Result<()> {
+            self.disk.read(o, b)
+        }
+        fn write(&self, o: u64, b: &[u8]) -> Result<()> {
+            self.disk.write(o, b)
+        }
+        fn len(&self) -> Result<u64> {
+            self.disk.len()
+        }
+        fn allocated(&self) -> Result<u64> {
+            self.disk.allocated()
+        }
+        fn punch(&self, o: u64, n: u64) -> Result<()> {
+            self.disk.punch(o, n)
+        }
+        fn barrier(&self) -> Result<()> {
+            if self
+                .remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                == Ok(1)
+            {
+                self.entered.send(())?;
+                let mut released = self.released.lock().unwrap();
+                while !*released {
+                    released = self.ready.wait(released).unwrap();
+                }
+            }
+            self.disk.barrier()
+        }
+    }
+    // Gate either barrier. Fail the barrier or the subsequent superblock write,
+    // including a short write; preserve exact confirmed roots under crash cuts.
+    for phase in [1, 2] {
+        for failure in [0, 1, 2] {
+            if phase == 2 && failure == 2 {
+                continue;
+            }
+            let (entered, notification) = mpsc::channel();
+            let disk = Arc::new(Gated {
+                disk: Model::default(),
+                remaining: AtomicUsize::new(0),
+                entered,
+                released: Mutex::new(false),
+                ready: Condvar::new(),
+            });
+            let mut core =
+                Core::create(disk.clone(), (PAGE * 16) as u64, policy(Codec::Lz4, true))?;
+            core.stage(0, Box::new([1; PAGE]))?;
+            core.commit()?;
+            disk.remaining.store(phase, Ordering::Release);
+            core.stage(0, Box::new([2; PAGE]))?;
+            core.stage(1, Box::new([2; PAGE]))?;
+            let (wake, _rx) = mpsc::sync_channel(1);
+            core.begin_commit(wake)?;
+            notification.recv_timeout(std::time::Duration::from_secs(3))?;
+            let frozen = core.view();
+            let progress = (|| -> Result<()> {
+                core.stage(0, Box::new([3; PAGE]))?;
+                core.stage(1, Box::new([0; PAGE]))?;
+                core.writeback()?;
+                anyhow::ensure!(
+                    core.read_block(0)?.unwrap()[0] == 3,
+                    "working root mismatch"
+                );
+                anyhow::ensure!(frozen.read(0)?.unwrap()[0] == 2, "frozen root mismatch");
+                Ok(())
+            })();
+            if failure != 0 {
+                let mut state = disk.disk.0.lock().unwrap();
+                state.fail = Some(state.ops + failure);
+                state.short_write = true;
+                state.errno = libc::ENOSPC;
+            }
+            *disk.released.lock().unwrap() = true;
+            disk.ready.notify_all();
+            progress?;
+            assert_eq!(core.finish_publication(true).is_ok(), failure == 0);
+            if failure != 0 {
+                assert!(core.stage(2, Box::new([4; PAGE])).is_err());
+            }
+            let state = disk.disk.0.lock().unwrap().clone();
+            for mask in [0, u64::MAX, 0x5555555555555555] {
+                for torn in [false, true] {
+                    let crashed = Model::from(state.clone());
+                    crashed.cut(mask, torn);
+                    let recovered = Core::open(crashed, Policy::default())?;
+                    let value = recovered.read_block(0)?.unwrap()[0];
+                    if failure == 0 {
+                        assert_eq!(value, 2);
+                    } else {
+                        assert!(value == 1 || value == 2);
+                    }
+                    if value == 2 {
+                        assert_eq!(recovered.read_block(1)?.unwrap()[0], 2);
+                    }
+                }
+            }
+            if failure == 0 {
+                core.commit()?;
+                let crashed = Model::from(disk.disk.0.lock().unwrap().clone());
+                crashed.cut(0, false);
+                let recovered = Core::open(crashed, Policy::default())?;
+                assert_eq!(recovered.read_block(0)?.unwrap()[0], 3);
+                assert_eq!(recovered.read_block(1)?.unwrap()[0], 0);
+            }
+        }
     }
     Ok(())
 }

@@ -125,19 +125,40 @@ impl PackedUpper {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (wake, rx) = std::sync::mpsc::sync_channel(1);
         let (state, changed, stopping) = (front.clone(), notify.clone(), stop.clone());
+        let publication_wake = wake.clone();
         let worker = thread::Builder::new()
             .name("packed-commit".into())
             .spawn(move || {
                 let mut immediate = false;
+                let mut publication_boundary = 0;
                 let mut last_commit = std::time::Instant::now();
                 loop {
                     if !immediate {
-                        let _ = rx.recv_timeout(
-                            Duration::from_millis(100).saturating_sub(last_commit.elapsed()),
-                        );
+                        let timeout = if core.publication_pending() {
+                            Duration::from_millis(100)
+                        } else {
+                            Duration::from_millis(100).saturating_sub(last_commit.elapsed())
+                        };
+                        let _ = rx.recv_timeout(timeout);
                     }
                     if stopping.load(std::sync::atomic::Ordering::Acquire) {
                         break;
+                    }
+                    match core.finish_publication(false) {
+                        Ok(true) => {
+                            let stats = core.stats();
+                            let mut f = state.lock().unwrap();
+                            match stats {
+                                Ok(stats) => f.stats = stats,
+                                Err(error) => f.view.fail(&error),
+                            }
+                            f.durable = f.durable.max(publication_boundary);
+                            f.view = core.view();
+                            drop(f);
+                            changed.notify_waiters();
+                        }
+                        Err(error) => state.lock().unwrap().view.fail(&error),
+                        Ok(false) => {}
                     }
                     // Only the coordinator owns Core. Foreground locks protect short
                     // pointer/map operations, never compression, disk I/O or barriers.
@@ -149,8 +170,9 @@ impl PackedUpper {
                             changed.notify_waiters();
                             continue;
                         }
-                        let commit = f.requested > f.durable
-                            || last_commit.elapsed() >= Duration::from_millis(100);
+                        let commit = !core.publication_pending()
+                            && (f.requested > f.durable
+                                || last_commit.elapsed() >= Duration::from_millis(100));
                         // Capacity wakeups from the previous inflight generation can
                         // be stale. Do not turn them into undersized new commits.
                         if !f.pending.is_empty()
@@ -182,7 +204,11 @@ impl PackedUpper {
                     core.policy = batch.2;
                     let result = if wrote || core.has_writeback() {
                         if batch.3 {
-                            core.commit()
+                            core.begin_commit(publication_wake.clone()).map(|began| {
+                                if began {
+                                    publication_boundary = batch.1;
+                                }
+                            })
                         } else {
                             core.writeback()
                         }
@@ -202,9 +228,6 @@ impl PackedUpper {
                     match result {
                         Ok(()) => {
                             f.view = core.view();
-                            if batch.3 {
-                                f.durable = batch.1;
-                            }
                             let retired = std::mem::take(&mut f.inflight);
                             for block in retired.into_values() {
                                 if Arc::strong_count(&block) == 1

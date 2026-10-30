@@ -53,6 +53,7 @@ pub struct Stats {
     pub metadata_ns: u64,
     pub encoding_wait_ns: u64,
     pub payload_io_ns: u64,
+    pub publication_ns: u64,
     pub metadata_cache_hits: u64,
     pub metadata_cache_misses: u64,
     pub bookkeeping_ns: u64,
@@ -382,6 +383,12 @@ impl ReadView {
     }
 }
 
+struct Publication {
+    root: Arc<Root>,
+    slot: usize,
+    blocks: u64,
+    done: std::sync::mpsc::Receiver<super::publish::Outcome>,
+}
 pub struct Core {
     disk: Arc<dyn Disk>,
     roots: [Option<Arc<Root>>; 2],
@@ -397,6 +404,8 @@ pub struct Core {
     poison: Arc<std::sync::Mutex<Option<String>>>,
     dedupe: HashMap<[u8; 32], u64>,
     encoders: super::encode::Pool,
+    publisher: Option<super::publish::Publisher>,
+    publication: Option<Publication>,
     tree_cache: tree::Cache,
     punched: BTreeSet<u64>,
     warm_cursor: u64,
@@ -436,6 +445,8 @@ impl Core {
             poison: Arc::new(std::sync::Mutex::new(None)),
             dedupe: HashMap::new(),
             encoders: super::encode::Pool::default(),
+            publisher: None,
+            publication: None,
             tree_cache: tree::Cache::default(),
             punched: BTreeSet::new(),
             warm_cursor: 0,
@@ -480,6 +491,8 @@ impl Core {
             poison: Arc::new(std::sync::Mutex::new(None)),
             dedupe: HashMap::new(),
             encoders: super::encode::Pool::default(),
+            publisher: None,
+            publication: None,
             tree_cache: tree::Cache::default(),
             punched: BTreeSet::new(),
             warm_cursor: 0,
@@ -564,6 +577,7 @@ impl Core {
             .flatten()
             .cloned()
             .chain(self.working.iter().cloned())
+            .chain(self.publication.iter().map(|p| p.root.clone()))
             .chain(self.readers.iter().filter_map(Weak::upgrade))
         {
             protected.union(&root.pages);
@@ -590,6 +604,69 @@ impl Core {
         self.stats.barrier_ns += t.elapsed().as_nanos() as u64;
         r
     }
+    fn metadata_base(&self) -> &Root {
+        self.publication
+            .as_ref()
+            .map(|p| p.root.as_ref())
+            .unwrap_or_else(|| self.roots[self.current].as_ref().unwrap())
+    }
+    pub fn publication_pending(&self) -> bool {
+        self.publication.is_some()
+    }
+    pub fn begin_commit(&mut self, wake: std::sync::mpsc::SyncSender<()>) -> Result<bool> {
+        self.check()?;
+        ensure!(
+            self.publication.is_none(),
+            "packed publication already in progress"
+        );
+        if self.pending.is_empty() && self.working.is_none() {
+            return Ok(false);
+        }
+        self.run_publish(None, true, Some(wake))?;
+        Ok(true)
+    }
+    pub fn finish_publication(&mut self, wait: bool) -> Result<bool> {
+        let Some(publication) = &self.publication else {
+            return Ok(false);
+        };
+        let outcome = if wait {
+            publication.done.recv().context("packed publisher exited")
+        } else {
+            match publication.done.try_recv() {
+                Ok(outcome) => Ok(outcome),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(error) => Err(anyhow::anyhow!(error)),
+            }
+        };
+        let publication = self.publication.take().unwrap();
+        let result = (|| {
+            let outcome = outcome?;
+            self.stats.barriers += outcome.barriers;
+            self.stats.barrier_ns += outcome.barrier_ns;
+            self.stats.publication_ns += outcome.elapsed_ns;
+            self.stats.host_peak_bytes = self.stats.host_peak_bytes.max(outcome.peak);
+            outcome.result?;
+            self.stats.committed_blocks += publication.blocks;
+            self.stats.generations += 1;
+            if let Some(old) = &self.roots[publication.slot] {
+                self.readers.push(Arc::downgrade(old));
+            }
+            if self
+                .working
+                .as_ref()
+                .is_some_and(|r| Arc::ptr_eq(r, &publication.root))
+            {
+                self.working = None;
+            }
+            self.roots[publication.slot] = Some(publication.root);
+            self.current = publication.slot;
+            Ok(true)
+        })();
+        if let Err(error) = &result {
+            *self.poison.lock().unwrap() = Some(format!("{error:#}"));
+        }
+        result
+    }
     pub fn commit(&mut self) -> Result<()> {
         self.publish(false, None)
     }
@@ -600,16 +677,22 @@ impl Core {
         if self.pending.is_empty() {
             return Ok(());
         }
-        self.run_publish(None, false)
+        self.run_publish(None, false, None)
     }
     fn publish(&mut self, force: bool, victim: Option<u64>) -> Result<()> {
+        self.finish_publication(true)?;
         self.check()?;
         if !force && self.pending.is_empty() && self.working.is_none() {
             return Ok(());
         }
-        self.run_publish(victim, true)
+        self.run_publish(victim, true, None)
     }
-    fn run_publish(&mut self, victim: Option<u64>, durable: bool) -> Result<()> {
+    fn run_publish(
+        &mut self,
+        victim: Option<u64>,
+        durable: bool,
+        wake: Option<std::sync::mpsc::SyncSender<()>>,
+    ) -> Result<()> {
         #[cfg(target_os = "macos")]
         unsafe {
             let mut class: libc::qos_class_t = std::mem::zeroed();
@@ -623,7 +706,7 @@ impl Core {
             }
         }
         let started = Instant::now();
-        let result = self.publish_inner(victim, durable);
+        let result = self.publish_inner(victim, durable, wake);
         if durable {
             self.stats.commit_ns += started.elapsed().as_nanos() as u64;
         } else {
@@ -634,12 +717,16 @@ impl Core {
         }
         result
     }
-    fn publish_inner(&mut self, victim: Option<u64>, durable: bool) -> Result<()> {
+    fn publish_inner(
+        &mut self,
+        victim: Option<u64>,
+        durable: bool,
+        wake: Option<std::sync::mpsc::SyncSender<()>>,
+    ) -> Result<()> {
         let prepare_started = Instant::now();
         let mut next = self.root().clone();
-        next.generation = self.roots[self.current]
-            .as_ref()
-            .unwrap()
+        next.generation = self
+            .metadata_base()
             .generation
             .checked_add(1)
             .context("packed generation overflow")?;
@@ -779,7 +866,7 @@ impl Core {
         let data_write_bytes = a.write_bytes;
         let metadata_started = Instant::now();
         self.map_delta.extend(maps);
-        let durable_next_id = self.roots[self.current].as_ref().unwrap().next_id;
+        let durable_next_id = self.metadata_base().next_id;
         for (&key, &value) in &objects {
             if value.is_none() && key >= durable_next_id {
                 // Born and retired within this generation: never serialize it.
@@ -799,7 +886,7 @@ impl Core {
         self.stats.metadata_write_calls += a.write_calls - data_write_calls;
         self.stats.metadata_ns += metadata_started.elapsed().as_nanos() as u64;
         let slot = 1 - self.current;
-        if durable {
+        if durable && wake.is_none() {
             self.barrier()?;
             self.disk.write((slot * PAGE) as u64, &next.encode())?;
             self.barrier()?;
@@ -858,14 +945,35 @@ impl Core {
         if durable {
             self.map_delta.clear();
             self.object_delta.clear();
-            self.stats.committed_blocks += self.working_blocks;
-            self.working_blocks = 0;
-            self.stats.generations += 1;
-            if let Some(old) = &self.roots[slot] {
-                self.readers.push(Arc::downgrade(old));
+            let blocks = std::mem::take(&mut self.working_blocks);
+            let next = Arc::new(next);
+            if let Some(wake) = wake {
+                if self.publisher.is_none() {
+                    self.publisher = Some(super::publish::Publisher::new()?);
+                }
+                let done = self.publisher.as_ref().unwrap().submit(
+                    self.disk.clone(),
+                    slot,
+                    next.encode(),
+                    self.poison.clone(),
+                    wake,
+                )?;
+                self.working = Some(next.clone());
+                self.publication = Some(Publication {
+                    root: next,
+                    slot,
+                    blocks,
+                    done,
+                });
+            } else {
+                self.stats.committed_blocks += blocks;
+                self.stats.generations += 1;
+                if let Some(old) = &self.roots[slot] {
+                    self.readers.push(Arc::downgrade(old));
+                }
+                self.roots[slot] = Some(next);
+                self.current = slot;
             }
-            self.roots[slot] = Some(Arc::new(next));
-            self.current = slot;
         } else {
             self.stats.writeback_batches += 1;
             self.working = Some(Arc::new(next));
@@ -920,7 +1028,11 @@ impl Core {
         r
     }
     fn maintenance_inner(&mut self, should_yield: &impl Fn() -> bool) -> Result<()> {
-        if !self.pending.is_empty() || self.working.is_some() || should_yield() {
+        if self.publication.is_some()
+            || !self.pending.is_empty()
+            || self.working.is_some()
+            || should_yield()
+        {
             return Ok(());
         }
         let end = self.disk.len()?.div_ceil(PAGE as u64);

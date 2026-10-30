@@ -11,3 +11,5 @@ pub use core::{Codec, Policy, Stats};
 mod tests;
 
 pub(crate) use disk::{Disk, FileDisk};
+
+mod publish;
