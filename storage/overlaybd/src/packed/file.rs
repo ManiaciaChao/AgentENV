@@ -1,7 +1,7 @@
 //! Logical-block adapter. This experimental API is deliberately not selected by
 //! existing upper creation paths until lifecycle and performance acceptance pass.
 use super::{
-    core::{Core, ReadView, DIRTY_LIMIT},
+    core::{Core, ReadView, DIRTY_LIMIT, READ_BLOCKS},
     disk::{FileDisk, PAGE},
     Policy, Stats,
 };
@@ -521,6 +521,57 @@ impl PackedUpper {
         }
         Ok(block)
     }
+    async fn read_aligned(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let lba = offset / PAGE as u64;
+        let count = dst.len() / PAGE;
+        let (pending, view) = {
+            let f = self.0.front.lock().unwrap();
+            f.view.check()?;
+            let pending: Vec<_> = (0..count)
+                .map(|i| {
+                    let lba = lba + i as u64;
+                    f.pending
+                        .get(&lba)
+                        .or_else(|| f.prepared.as_ref().and_then(|p| p.blocks.get(&lba)))
+                        .or_else(|| f.inflight.get(&lba))
+                        .cloned()
+                })
+                .collect();
+            (pending, f.view.clone())
+        };
+        let mut skip = 0;
+        for (i, block) in pending.iter().enumerate() {
+            if let Some(block) = block {
+                dst[i * PAGE..(i + 1) * PAGE].copy_from_slice(block.as_ref());
+                skip |= 1 << i;
+            }
+        }
+        let covered = view.read_blocks(lba, skip, dst)?;
+        let mut i = 0;
+        while i < count {
+            if covered & (1 << i) != 0 {
+                i += 1;
+                continue;
+            }
+            let first = i;
+            while i < count && covered & (1 << i) == 0 {
+                i += 1;
+            }
+            let bytes = &mut dst[first * PAGE..i * PAGE];
+            if let Some(lower) = &self.0.lower {
+                ensure!(
+                    lower
+                        .read_at_into(offset + (first * PAGE) as u64, bytes)
+                        .await?
+                        == bytes.len(),
+                    "short packed lower read"
+                );
+            } else {
+                bytes.fill(0);
+            }
+        }
+        Ok(())
+    }
     // Keep aligned bulk writes in bounded 128 KiB frontend batches. The range
     // lease still serializes overlaps. Short locks reserve capacity and publish
     // mappings, with the immutable copy prepared between them.
@@ -721,6 +772,7 @@ impl PackedUpper {
             stats.frontend_stage_ns = self.0.stage_ns.load(std::sync::atomic::Ordering::Relaxed);
             stats.frontend_wait_ns = self.0.wait_ns.load(std::sync::atomic::Ordering::Relaxed);
             stats.caller_qos = self.0.caller_qos.load(std::sync::atomic::Ordering::Relaxed);
+            f.view.read_statistics(&mut stats);
             Ok(stats)
         }
     }
@@ -767,6 +819,12 @@ impl VirtualFile for PackedUpper {
         while done < n {
             let pos = offset + done as u64;
             let inside = (pos % PAGE as u64) as usize;
+            if inside == 0 && n - done >= PAGE {
+                let take = ((n - done) / PAGE).min(READ_BLOCKS) * PAGE;
+                self.read_aligned(pos, &mut dst[done..done + take]).await?;
+                done += take;
+                continue;
+            }
             let take = (PAGE - inside).min(n - done);
             let block = self.block(pos / PAGE as u64).await?;
             dst[done..done + take].copy_from_slice(&block[inside..inside + take]);

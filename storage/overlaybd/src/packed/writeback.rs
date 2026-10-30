@@ -12,8 +12,30 @@ use std::{
 pub(super) struct ReadCache {
     buffers: Mutex<std::collections::BTreeMap<u64, Arc<Vec<u8>>>>,
     high_water: std::sync::atomic::AtomicU64,
+    read_blocks: std::sync::atomic::AtomicU64,
+    read_calls: std::sync::atomic::AtomicU64,
+    read_bytes: std::sync::atomic::AtomicU64,
 }
 impl ReadCache {
+    pub fn count_read_blocks(&self, blocks: usize) {
+        self.read_blocks
+            .fetch_add(blocks as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn read_statistics(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.read_blocks.load(Relaxed),
+            self.read_calls.load(Relaxed),
+            self.read_bytes.load(Relaxed),
+        )
+    }
+    fn read_disk(&self, disk: &dyn Disk, offset: u64, dst: &mut [u8]) -> Result<()> {
+        self.read_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.read_bytes
+            .fetch_add(dst.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        disk.read(offset, dst)
+    }
     pub fn end(&self) -> u64 {
         self.high_water.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -60,7 +82,8 @@ impl ReadCache {
         let mut at = offset;
         for (start, bytes) in pinned {
             if start > at {
-                disk.read(
+                self.read_disk(
+                    disk,
                     at,
                     &mut dst[(at - offset) as usize..(start - offset) as usize],
                 )?;
@@ -72,7 +95,7 @@ impl ReadCache {
             at = take_end;
         }
         if at < end {
-            disk.read(at, &mut dst[(at - offset) as usize..])?;
+            self.read_disk(disk, at, &mut dst[(at - offset) as usize..])?;
         }
         Ok(())
     }

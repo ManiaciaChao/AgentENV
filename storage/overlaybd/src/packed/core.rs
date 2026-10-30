@@ -13,6 +13,7 @@ use std::{
 };
 pub const SEGMENT: u64 = 2 * 1024 * 1024;
 pub const DIRTY_LIMIT: usize = 16 * 1024 * 1024;
+pub(super) const READ_BLOCKS: usize = 32;
 const MAGIC: &[u8; 8] = b"OBDPACK1";
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -84,6 +85,9 @@ pub struct Stats {
     pub frontend_wait_ns: u64,
     pub metadata_pages_written: u64,
     pub metadata_write_calls: u64,
+    pub upper_read_blocks: u64,
+    pub host_read_calls: u64,
+    pub host_read_bytes: u64,
 }
 // Occupancy alone is insufficient: a sparse one-page tail cannot shrink.
 // Reserve one page for padding at a destination segment boundary, and demand
@@ -556,36 +560,122 @@ impl ReadView {
         }
         result
     }
+    /// Read one immutable mapping version, sorting physical objects so a
+    /// contiguous logical request does not become one host pread per 4 KiB.
+    /// Bits in skip belong to newer frontend buffers; unset return bits use lower.
+    pub(super) fn read_blocks(&self, lba: u64, skip: u32, dst: &mut [u8]) -> Result<u32> {
+        self.check()?;
+        ensure!(
+            dst.len().is_multiple_of(PAGE) && dst.len() / PAGE <= READ_BLOCKS,
+            "invalid packed read batch"
+        );
+        let result = (|| {
+            let mut covered = skip;
+            let mut entries = [(0usize, [0u64; 6]); READ_BLOCKS];
+            let mut count = 0;
+            for i in 0..dst.len() / PAGE {
+                if skip & (1 << i) != 0 {
+                    continue;
+                }
+                let Some(&id) = self.root.map.get(&(lba + i as u64)) else {
+                    continue;
+                };
+                covered |= 1 << i;
+                if id == 0 {
+                    dst[i * PAGE..(i + 1) * PAGE].fill(0);
+                } else {
+                    entries[count] = (
+                        i,
+                        *self
+                            .root
+                            .objects
+                            .get(&id)
+                            .context("missing packed object")?,
+                    );
+                    count += 1;
+                }
+            }
+            self.writes.count_read_blocks(count);
+            let entries = &mut entries[..count];
+            entries.sort_unstable_by_key(|(_, value)| value[0]);
+            let mut stored = Vec::new();
+            let mut first = 0;
+            while first < count {
+                let start = entries[first].1[0];
+                let mut end = start + entries[first].1[1];
+                let mut last = first + 1;
+                while last < count {
+                    let v = &entries[last].1;
+                    let next_end = end.max(v[0] + v[1]);
+                    // Only alignment padding may be read speculatively. Bound
+                    // temporary memory and I/O even for fragmented/random maps.
+                    if v[0] > end + 64 || next_end - start > (READ_BLOCKS * PAGE) as u64 {
+                        break;
+                    }
+                    end = next_end;
+                    last += 1;
+                }
+                let bytes = (end - start) as usize;
+                stored.reserve_exact(bytes.saturating_sub(stored.len()));
+                stored.resize(bytes, 0);
+                self.writes.read(self.disk.as_ref(), start, &mut stored)?;
+                for &(i, v) in &entries[first..last] {
+                    let at = (v[0] - start) as usize;
+                    decode_into(
+                        &v,
+                        &stored[at..at + v[1] as usize],
+                        &mut dst[i * PAGE..(i + 1) * PAGE],
+                    )?;
+                }
+                first = last;
+            }
+            Ok(covered)
+        })();
+        if let Err(error) = &result {
+            self.fail(error);
+        }
+        result
+    }
+    pub(super) fn read_statistics(&self, stats: &mut Stats) {
+        let (blocks, calls, bytes) = self.writes.read_statistics();
+        stats.upper_read_blocks = blocks;
+        stats.host_read_calls = calls;
+        stats.host_read_bytes = bytes;
+    }
     fn decode(&self, v: &Value) -> Result<Box<[u8; PAGE]>> {
+        self.writes.count_read_blocks(1);
         let mut stored = vec![0; v[1] as usize];
         self.writes.read(self.disk.as_ref(), v[0], &mut stored)?;
         let mut out = Box::new([0; PAGE]);
-        match v[2] {
-            0 => out.copy_from_slice(&stored),
-            1 => {
-                let n = unsafe {
-                    lz4_sys::LZ4_decompress_safe(
-                        stored.as_ptr().cast(),
-                        out.as_mut_ptr().cast(),
-                        stored.len() as i32,
-                        PAGE as i32,
-                    )
-                };
-                ensure!(n == PAGE as i32, "corrupt packed LZ4 object");
-            }
-            2 => {
-                let b = zstd::bulk::decompress(&stored, PAGE)?;
-                ensure!(b.len() == PAGE, "corrupt packed Zstd object");
-                out.copy_from_slice(&b);
-            }
-            _ => bail!("unsupported packed codec"),
-        }
-        ensure!(
-            crc32c::crc32c(out.as_slice()) as u64 == v[3],
-            "packed data checksum mismatch"
-        );
+        decode_into(v, &stored, out.as_mut_slice())?;
         Ok(out)
     }
+}
+fn decode_into(v: &Value, stored: &[u8], out: &mut [u8]) -> Result<()> {
+    match v[2] {
+        0 => out.copy_from_slice(stored),
+        1 => {
+            let n = unsafe {
+                lz4_sys::LZ4_decompress_safe(
+                    stored.as_ptr().cast(),
+                    out.as_mut_ptr().cast(),
+                    stored.len() as i32,
+                    PAGE as i32,
+                )
+            };
+            ensure!(n == PAGE as i32, "corrupt packed LZ4 object");
+        }
+        2 => {
+            let n = zstd::bulk::decompress_to_buffer(stored, out)?;
+            ensure!(n == PAGE, "corrupt packed Zstd object");
+        }
+        _ => bail!("unsupported packed codec"),
+    }
+    ensure!(
+        crc32c::crc32c(out) as u64 == v[3],
+        "packed data checksum mismatch"
+    );
+    Ok(())
 }
 
 struct Publication {
@@ -1606,6 +1696,7 @@ impl Core {
         let mut s = self.stats.clone();
         s.host_bytes = self.disk.allocated()?;
         s.dirty_bytes = self.pending.len() * PAGE;
+        self.view().read_statistics(&mut s);
         s.live_encoded_bytes = self.root().encoded_bytes;
         let protected = self.protected();
         s.cleaner_pending_bytes = self

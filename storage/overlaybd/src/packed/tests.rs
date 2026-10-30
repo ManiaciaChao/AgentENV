@@ -127,6 +127,19 @@ fn policy_changes_preserve_mixed_objects_and_zero_masks() -> Result<()> {
     }
     assert_eq!(c.read_block(8)?.unwrap().as_slice(), &[0; PAGE]);
     assert!(c.read_block(100)?.is_none());
+    let mut batched = vec![99; 32 * PAGE];
+    assert_eq!(c.view().read_blocks(0, 0, &mut batched)?, 0x707);
+    for i in 0..32 {
+        let value = match i {
+            0..=2 => i as u8 + 1,
+            8 => 0,
+            9..=10 => i as u8 - 7,
+            _ => 99,
+        };
+        assert!(batched[i * PAGE..(i + 1) * PAGE]
+            .iter()
+            .all(|b| *b == value));
+    }
     Ok(())
 }
 #[test]
@@ -1355,5 +1368,81 @@ async fn streamed_mixed_capacity_buffers_preserve_contents() -> Result<()> {
             &data[(lba as usize * PAGE) % data.len()..(lba as usize * PAGE) % data.len() + PAGE]
         );
     }
+    Ok(())
+}
+
+#[test]
+fn coalesced_reads_preserve_codecs_shared_objects_and_pinned_versions() -> Result<()> {
+    for policy in [
+        policy(Codec::None, false),
+        policy(Codec::Lz4, false),
+        policy(Codec::Zstd, false),
+        policy(Codec::Lz4, true),
+    ] {
+        let disk = Arc::new(Model::default());
+        let mut core = Core::create(disk.clone(), 64 * PAGE as u64, policy)?;
+        let mut expected = vec![0; 32 * PAGE];
+        for i in 0..32 {
+            let value = (i % 8 + 1) as u8;
+            expected[i * PAGE..(i + 1) * PAGE].fill(value);
+            core.stage(i as u64, Box::new([value; PAGE]))?;
+        }
+        core.commit()?;
+        let before = core.stats()?;
+        let pinned = core.view();
+        let mut out = vec![0; expected.len()];
+        assert_eq!(pinned.read_blocks(0, 0, &mut out)?, u32::MAX);
+        assert_eq!(out, expected);
+        let after = core.stats()?;
+        assert_eq!(after.upper_read_blocks - before.upper_read_blocks, 32);
+        assert_eq!(after.host_read_calls - before.host_read_calls, 1);
+        for i in 0..32 {
+            if i % 3 == 0 {
+                core.stage(i as u64, Box::new([0; PAGE]))?;
+            }
+        }
+        core.commit()?;
+        core.maintenance()?;
+        assert_eq!(pinned.read_blocks(0, 0, &mut out)?, u32::MAX);
+        assert_eq!(out, expected);
+        for i in (0..32).step_by(3) {
+            expected[i * PAGE..(i + 1) * PAGE].fill(0);
+        }
+        drop(pinned);
+        drop(core);
+        disk.cut(0, false);
+        let core = Core::open(disk, Policy::default())?;
+        assert_eq!(core.view().read_blocks(0, 0, &mut out)?, u32::MAX);
+        assert_eq!(out, expected);
+        // Absence must be distinguishable from explicit zero. The caller owns
+        // skipped frontend bytes and lower fallback for uncovered blocks.
+        out.fill(99);
+        assert_eq!(core.view().read_blocks(32, 1 << 7, &mut out)?, 1 << 7);
+        assert!(out.iter().all(|b| *b == 99));
+    }
+    Ok(())
+}
+
+#[test]
+fn coalesced_read_checks_each_object_and_does_not_decode_skipped_data() -> Result<()> {
+    let disk = Arc::new(Model::default());
+    let mut core = Core::create(disk.clone(), 32 * PAGE as u64, Policy::default())?;
+    for i in 0..32 {
+        core.stage(i, Box::new([i as u8 + 1; PAGE]))?;
+    }
+    core.commit()?;
+    let object_root = {
+        let state = disk.0.lock().unwrap();
+        super::tree::get64(&state.volatile[PAGE..2 * PAGE], 48)
+    };
+    let (objects, _) = super::tree::load(disk.as_ref(), object_root)?;
+    let target = objects.get(&8).unwrap()[0] as usize;
+    disk.0.lock().unwrap().volatile[target] ^= 0x80;
+    let view = core.view();
+    let mut out = vec![99; PAGE * 32];
+    assert_eq!(view.read_blocks(0, 1 << 7, &mut out)?, u32::MAX);
+    assert!(out[7 * PAGE..8 * PAGE].iter().all(|b| *b == 99));
+    assert!(view.read_blocks(0, 0, &mut out).is_err());
+    assert!(core.stage(0, Box::new([0; PAGE])).is_err());
     Ok(())
 }
