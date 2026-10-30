@@ -364,10 +364,63 @@ impl PackedUpper {
         }
         Ok(block)
     }
+    // Keep aligned bulk writes in bounded 128 KiB frontend batches. The range
+    // lease still serializes overlaps; one short lock admits data and assigns
+    // sequence numbers, without per-4-KiB async staging/lock round trips.
+    async fn stage_aligned(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let (done, wake) = {
+                let mut f = self.0.front.lock().unwrap();
+                f.view.check()?;
+                let mut done = 0;
+                for chunk in bytes.chunks_exact(PAGE).take(32) {
+                    let lba = (offset + done as u64) / PAGE as u64;
+                    if !f.pending.contains_key(&lba)
+                        && (f.pending.len() + f.inflight.len()) * PAGE >= DIRTY_LIMIT
+                    {
+                        break;
+                    }
+                    let sequence = f
+                        .sequence
+                        .checked_add(1)
+                        .context("packed write sequence overflow")?;
+                    let mut block = f.recycled.pop().unwrap_or_else(|| Arc::new([0; PAGE]));
+                    Arc::get_mut(&mut block)
+                        .expect("exclusive recycled block")
+                        .copy_from_slice(chunk);
+                    if let Some(old) = f.pending.insert(lba, block) {
+                        if Arc::strong_count(&old) == 1
+                            && f.recycled.len() + f.pending.len() + f.inflight.len()
+                                < DIRTY_LIMIT / PAGE
+                        {
+                            f.recycled.push(old);
+                        }
+                    }
+                    f.sequence = sequence;
+                    done += PAGE;
+                }
+                (done, f.pending.len() * PAGE >= GENERATION_LIMIT)
+            };
+            if wake || done == 0 {
+                let _ = self.0.wake.try_send(());
+            }
+            if done != 0 {
+                return Ok(done);
+            }
+            notified.await;
+        }
+    }
     async fn write_locked(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
         let mut done = 0;
         while done < bytes.len() {
             let pos = offset + done as u64;
+            if pos % PAGE as u64 == 0 && bytes.len() - done >= PAGE {
+                done += self.stage_aligned(pos, &bytes[done..]).await?;
+                continue;
+            }
             let lba = pos / PAGE as u64;
             let inside = (pos % PAGE as u64) as usize;
             let n = (PAGE - inside).min(bytes.len() - done);

@@ -51,6 +51,8 @@ pub struct Stats {
     pub coordinator_qos: u32,
     pub objects_and_data_ns: u64,
     pub metadata_ns: u64,
+    pub encoding_wait_ns: u64,
+    pub payload_io_ns: u64,
     pub metadata_cache_hits: u64,
     pub metadata_cache_misses: u64,
     pub bookkeeping_ns: u64,
@@ -75,7 +77,7 @@ struct Root {
     next_id: u64,
     size: u64,
     uuid: [u8; 16],
-    map: Map<Value>,
+    map: Map<u64>,
     objects: Map<Value>,
     pages: PageSet,
     data_counts: Map<u32>,
@@ -177,7 +179,10 @@ impl Root {
             }
         }
         r.pages.extend(r.data_counts.keys().copied());
-        r.map = map.into_iter().collect();
+        r.map = map
+            .into_iter()
+            .map(|(key, value)| (key, value[0]))
+            .collect();
         r.encoded_bytes = objects.values().map(|v| v[1]).sum();
         r.aligned_bytes = objects.values().map(|v| v[1].next_multiple_of(64)).sum();
         r.objects = objects.into_iter().collect();
@@ -198,6 +203,7 @@ struct Allocation {
     output_offset: u64,
     write_calls: u64,
     write_bytes: u64,
+    io_ns: u64,
 }
 impl Pages for Allocation {
     fn allocate(&mut self) -> u64 {
@@ -238,7 +244,9 @@ impl Allocation {
     }
     fn flush_data(&mut self) -> Result<()> {
         if !self.output.is_empty() {
+            let started = Instant::now();
             self.disk.write(self.output_offset, &self.output)?;
+            self.io_ns += started.elapsed().as_nanos() as u64;
             self.write_calls += 1;
             self.write_bytes += self.output.len() as u64;
             self.output.clear();
@@ -326,20 +334,15 @@ impl ReadView {
         *self.poison.lock().unwrap() = Some(format!("{e:#}"));
     }
     pub fn mappings(&self) -> Vec<(u64, bool)> {
-        self.root.map.iter().map(|(&l, v)| (l, v[0] == 0)).collect()
+        self.root.map.iter().map(|(&l, v)| (l, *v == 0)).collect()
     }
     pub fn read(&self, lba: u64) -> Result<Option<Box<[u8; PAGE]>>> {
         self.check()?;
         let result = (|| match self.root.map.get(&lba) {
             None => Ok(None),
-            Some(v) if v[0] == 0 => Ok(Some(Box::new([0; PAGE]))),
+            Some(v) if *v == 0 => Ok(Some(Box::new([0; PAGE]))),
             Some(v) => Ok(Some(
-                self.decode(
-                    self.root
-                        .objects
-                        .get(&v[0])
-                        .context("missing packed object")?,
-                )?,
+                self.decode(self.root.objects.get(v).context("missing packed object")?)?,
             )),
         })();
         if let Err(e) = &result {
@@ -385,6 +388,10 @@ pub struct Core {
     current: usize,
     working: Option<Arc<Root>>,
     working_blocks: u64,
+    // Deltas relative to the latest durable trees. Working reads use Root's
+    // in-memory indexes; capacity writeback does not serialize these trees.
+    map_delta: BTreeMap<u64, u64>,
+    object_delta: BTreeMap<u64, Option<Value>>,
     pub policy: Policy,
     pub pending: BTreeMap<u64, Arc<[u8; PAGE]>>,
     poison: Arc<std::sync::Mutex<Option<String>>>,
@@ -422,6 +429,8 @@ impl Core {
             current: 0,
             working: None,
             working_blocks: 0,
+            map_delta: BTreeMap::new(),
+            object_delta: BTreeMap::new(),
             policy,
             pending: BTreeMap::new(),
             poison: Arc::new(std::sync::Mutex::new(None)),
@@ -464,6 +473,8 @@ impl Core {
             current,
             working: None,
             working_blocks: 0,
+            map_delta: BTreeMap::new(),
+            object_delta: BTreeMap::new(),
             policy,
             pending: BTreeMap::new(),
             poison: Arc::new(std::sync::Mutex::new(None)),
@@ -501,7 +512,7 @@ impl Core {
             .root()
             .map
             .iter()
-            .map(|(&lba, v)| (lba, v[0] == 0))
+            .map(|(&lba, v)| (lba, *v == 0))
             .collect();
         entries.extend(
             self.pending
@@ -520,12 +531,12 @@ impl Core {
         }
         let result = (|| match self.root().map.get(&lba) {
             None => Ok(None),
-            Some(v) if v[0] == 0 => Ok(Some(Box::new([0; PAGE]))),
+            Some(v) if *v == 0 => Ok(Some(Box::new([0; PAGE]))),
             Some(v) => Ok(Some(
                 self.decode(
                     self.root()
                         .objects
-                        .get(&v[0])
+                        .get(v)
                         .context("missing packed object")?,
                 )?,
             )),
@@ -652,14 +663,22 @@ impl Core {
             output_offset: 0,
             write_calls: 0,
             write_bytes: 0,
+            io_ns: 0,
         };
         self.stats.prepare_ns += prepare_started.elapsed().as_nanos() as u64;
         let objects_started = Instant::now();
-        let (mut maps, mut objects) = (BTreeMap::new(), BTreeMap::new());
+        let (mut maps, mut objects) = (Vec::new(), BTreeMap::new());
         let pending = self.pending.clone();
         let mut fresh: HashMap<[u8; 32], (u64, Arc<[u8; PAGE]>)> = HashMap::new();
-        let batches = self.encoders.encode(&pending, self.policy)?;
-        for batch in &batches {
+        let encoding_started = Instant::now();
+        let mut batches = self.encoders.encode(&pending, self.policy)?;
+        self.stats.encoding_wait_ns += encoding_started.elapsed().as_nanos() as u64;
+        loop {
+            let waiting = Instant::now();
+            let batch = batches.next();
+            self.stats.encoding_wait_ns += waiting.elapsed().as_nanos() as u64;
+            let Some(batch) = batch else { break };
+            let batch = batch?;
             for encoded in &batch.blocks {
                 let lba = &encoded.lba;
                 let b = &encoded.plain;
@@ -686,6 +705,9 @@ impl Core {
                     }
                     if let Some(id) = found {
                         self.stats.dedupe_hits += 1;
+                        let value = next.objects.get_mut(&id).unwrap();
+                        value[4] += 1;
+                        objects.insert(id, Some(*value));
                         id
                     } else {
                         let id = next.next_id;
@@ -700,31 +722,27 @@ impl Core {
                             &batch.bytes[encoded.offset..encoded.offset + encoded.len]
                         };
                         let offset = a.payload(bytes)?;
-                        let value = [offset, bytes.len() as u64, codec, encoded.crc, 0, 0];
+                        let value = [offset, bytes.len() as u64, codec, encoded.crc, 1, 0];
                         next.objects.insert(id, value);
+                        objects.insert(id, Some(value));
                         if self.policy.dedupe {
                             fresh.insert(hash, (id, b.clone()));
                         }
                         id
                     }
                 };
-                if let Some(old) = next.map.insert(*lba, [id, 0, 0, 0, 0, 0]) {
-                    if old[0] != 0 {
+                if let Some(old) = next.map.insert(*lba, id) {
+                    if old != 0 {
                         let v = next
                             .objects
-                            .get_mut(&old[0])
+                            .get_mut(&old)
                             .context("packed old object missing")?;
                         ensure!(v[4] > 0, "packed reference underflow");
                         v[4] -= 1;
-                        objects.insert(old[0], Some(*v));
+                        objects.insert(old, Some(*v));
                     }
                 }
-                if id != 0 {
-                    let v = next.objects.get_mut(&id).unwrap();
-                    v[4] += 1;
-                    objects.insert(id, Some(*v));
-                }
-                maps.insert(*lba, Some([id, 0, 0, 0, 0, 0]));
+                maps.push((*lba, id));
             }
         }
         let dead: Vec<_> = objects
@@ -756,11 +774,25 @@ impl Core {
         a.finish_pack()?;
         a.flush_data()?;
         self.stats.objects_and_data_ns += objects_started.elapsed().as_nanos() as u64;
+        self.stats.payload_io_ns += a.io_ns;
         let data_write_calls = a.write_calls;
         let data_write_bytes = a.write_bytes;
         let metadata_started = Instant::now();
-        next.map_root = tree::update(&mut a, next.map_root, tree::HEIGHT, &maps)?;
-        next.objects_root = tree::update(&mut a, next.objects_root, tree::HEIGHT, &objects)?;
+        self.map_delta.extend(maps);
+        let durable_next_id = self.roots[self.current].as_ref().unwrap().next_id;
+        for (&key, &value) in &objects {
+            if value.is_none() && key >= durable_next_id {
+                // Born and retired within this generation: never serialize it.
+                self.object_delta.remove(&key);
+            } else {
+                self.object_delta.insert(key, value);
+            }
+        }
+        if durable {
+            next.map_root = tree::update_mappings(&mut a, next.map_root, &self.map_delta)?;
+            next.objects_root =
+                tree::update(&mut a, next.objects_root, tree::HEIGHT, &self.object_delta)?;
+        }
         // Only immutable old tree nodes are read during the COW traversal.
         // New nodes may be coalesced, but must reach the file before barrier one.
         a.flush_data()?;
@@ -824,6 +856,8 @@ impl Core {
             self.readers.push(Arc::downgrade(&old));
         }
         if durable {
+            self.map_delta.clear();
+            self.object_delta.clear();
             self.stats.committed_blocks += self.working_blocks;
             self.working_blocks = 0;
             self.stats.generations += 1;

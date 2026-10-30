@@ -6,7 +6,7 @@ use super::{
 use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{mpsc, Arc},
     thread,
 };
@@ -158,60 +158,137 @@ impl Drop for SharedPool {
 pub(super) struct Pool {
     shared: Option<Arc<SharedPool>>,
 }
+// At most four 1 MiB jobs are outstanding. Consuming one result schedules the
+// next job before the coordinator applies it, overlapping encode and disk work.
+const JOB_BLOCKS: usize = 256;
+pub(super) struct Encoding {
+    inline: Option<Result<Batch>>,
+    queued: VecDeque<Input>,
+    running: VecDeque<mpsc::Receiver<Result<Batch>>>,
+    pool: Option<Arc<SharedPool>>,
+    policy: Policy,
+    failed: bool,
+}
+impl Encoding {
+    fn submit(&mut self) -> Result<()> {
+        if let Some(input) = self.queued.pop_front() {
+            let (result, rx) = mpsc::channel();
+            self.pool
+                .as_ref()
+                .unwrap()
+                .tx
+                .as_ref()
+                .unwrap()
+                .send(Job {
+                    input,
+                    policy: self.policy,
+                    result,
+                })
+                .map_err(|_| anyhow::anyhow!("packed encoder exited"))?;
+            self.running.push_back(rx);
+        }
+        Ok(())
+    }
+}
+impl Iterator for Encoding {
+    type Item = Result<Batch>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        if let Some(batch) = self.inline.take() {
+            return Some(batch);
+        }
+        let rx = self.running.pop_front()?;
+        let result = (|| {
+            let batch = rx.recv().context("packed encoder exited")??;
+            self.submit()?;
+            Ok(batch)
+        })();
+        self.failed = result.is_err();
+        Some(result)
+    }
+}
 impl Pool {
     pub fn encode(
         &mut self,
         pending: &BTreeMap<u64, Arc<[u8; PAGE]>>,
         policy: Policy,
-    ) -> Result<Vec<Batch>> {
+    ) -> Result<Encoding> {
         ensure!(
             pending.len() <= DIRTY_LIMIT / PAGE,
             "packed encoding exceeds dirty budget"
         );
+        let mut stream = Encoding {
+            inline: None,
+            queued: VecDeque::new(),
+            running: VecDeque::new(),
+            pool: None,
+            policy,
+            failed: false,
+        };
         if pending.len() < 128 {
-            return Ok(vec![prepare(
+            stream.inline = Some(prepare(
                 pending.iter().map(|(&l, b)| (l, b.clone())).collect(),
                 policy,
-            )?]);
+            ));
+            return Ok(stream);
         }
         if self.shared.is_none() {
             self.shared = Some(SharedPool::acquire()?);
         }
-        let pool = self.shared.as_ref().unwrap();
-        let per_worker = pending.len().div_ceil(pool.workers.len());
+        let pool = self.shared.as_ref().unwrap().clone();
         let mut input = pending.iter();
-        let mut results = Vec::new();
-        for _ in &pool.workers {
+        loop {
             let job: Input = input
                 .by_ref()
-                .take(per_worker)
+                .take(JOB_BLOCKS)
                 .map(|(&l, b)| (l, b.clone()))
                 .collect();
             if job.is_empty() {
                 break;
             }
-            let (result, rx) = mpsc::channel();
-            pool.tx
-                .as_ref()
-                .unwrap()
-                .send(Job {
-                    input: job,
-                    policy,
-                    result,
-                })
-                .map_err(|_| anyhow::anyhow!("packed encoder exited"))?;
-            results.push(rx);
+            stream.queued.push_back(job);
         }
-        // Per-call reply channels keep simultaneous uppers and policies isolated.
-        results
-            .into_iter()
-            .map(|rx| rx.recv().context("packed encoder exited")?)
-            .collect()
+        let count = pool.workers.len();
+        stream.pool = Some(pool);
+        for _ in 0..count {
+            stream.submit()?;
+        }
+        Ok(stream)
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stream_bounds_inflight_jobs_and_can_be_abandoned() -> Result<()> {
+        let input = (0..4096).map(|i| (i, Arc::new([i as u8; PAGE]))).collect();
+        let mut pool = Pool::default();
+        let mut stream = pool.encode(&input, Policy::default())?;
+        let workers = stream.pool.as_ref().unwrap().workers.len();
+        assert_eq!(stream.running.len(), workers);
+        assert_eq!(stream.queued.len() + stream.running.len(), 16);
+        let first = stream.next().unwrap()?;
+        assert_eq!(first.blocks.len(), JOB_BLOCKS);
+        assert_eq!(stream.running.len(), workers);
+        assert_eq!(stream.queued.len() + stream.running.len(), 15);
+        drop(stream); // Outstanding replies can be discarded without blocking workers.
+        let mut count = 0;
+        for batch in pool.encode(
+            &input,
+            Policy {
+                compression: Codec::None,
+                dedupe: false,
+            },
+        )? {
+            let batch = batch?;
+            assert!(batch.blocks.iter().all(|b| b.codec == 0));
+            count += batch.blocks.len();
+        }
+        assert_eq!(count, input.len());
+        Ok(())
+    }
     #[test]
     fn different_uppers_share_at_most_four_workers() -> Result<()> {
         let a = SharedPool::acquire()?;
@@ -250,6 +327,7 @@ mod tests {
             )?;
             let mut seen = 0;
             for batch in batches {
+                let batch = batch?;
                 for block in batch.blocks {
                     assert_eq!(block.lba, seen);
                     seen += 1;

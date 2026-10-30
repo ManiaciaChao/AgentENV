@@ -1,10 +1,12 @@
 //! In-memory COW indexes. Disk format and durable publication are unchanged.
 //! A root clone shares chunks; updates copy only the chunks they touch.
+//! Sorted vectors within 256-key chunks avoid allocating/cloning BTree nodes
+//! per object while keeping sparse keys compact and iteration ordered.
 use std::{collections::BTreeMap, ops::Index, sync::Arc};
 
 #[derive(Clone, Default)]
 pub(super) struct Map<V: Clone> {
-    chunks: BTreeMap<u64, Arc<BTreeMap<u64, V>>>,
+    chunks: BTreeMap<u64, Arc<Vec<(u64, V)>>>,
     len: usize,
 }
 impl<V: Clone> Map<V> {
@@ -18,34 +20,43 @@ impl<V: Clone> Map<V> {
         self.len
     }
     pub fn get(&self, key: &u64) -> Option<&V> {
-        self.chunks.get(&(key / 256))?.get(key)
+        let chunk = self.chunks.get(&(key / 256))?;
+        let index = chunk.binary_search_by_key(key, |(k, _)| *k).ok()?;
+        Some(&chunk[index].1)
     }
     pub fn contains_key(&self, key: &u64) -> bool {
         self.get(key).is_some()
     }
     pub fn get_mut(&mut self, key: &u64) -> Option<&mut V> {
-        Arc::make_mut(self.chunks.get_mut(&(key / 256))?).get_mut(key)
+        let chunk = Arc::make_mut(self.chunks.get_mut(&(key / 256))?);
+        let index = chunk.binary_search_by_key(key, |(k, _)| *k).ok()?;
+        Some(&mut chunk[index].1)
     }
     pub fn insert(&mut self, key: u64, value: V) -> Option<V> {
-        let old = Arc::make_mut(self.chunks.entry(key / 256).or_default()).insert(key, value);
-        if old.is_none() {
-            self.len += 1;
+        let chunk = Arc::make_mut(self.chunks.entry(key / 256).or_default());
+        match chunk.binary_search_by_key(&key, |(k, _)| *k) {
+            Ok(index) => Some(std::mem::replace(&mut chunk[index].1, value)),
+            Err(index) => {
+                chunk.insert(index, (key, value));
+                self.len += 1;
+                None
+            }
         }
-        old
     }
     pub fn remove(&mut self, key: &u64) -> Option<V> {
         let chunk = self.chunks.get_mut(&(key / 256))?;
-        let old = Arc::make_mut(chunk).remove(key);
-        if old.is_some() {
-            self.len -= 1;
-        }
+        let index = chunk.binary_search_by_key(key, |(k, _)| *k).ok()?;
+        let old = Arc::make_mut(chunk).remove(index).1;
+        self.len -= 1;
         if chunk.is_empty() {
             self.chunks.remove(&(key / 256));
         }
-        old
+        Some(old)
     }
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &V)> {
-        self.chunks.values().flat_map(|c| c.iter())
+        self.chunks
+            .values()
+            .flat_map(|c| c.iter().map(|(k, v)| (k, v)))
     }
     pub fn values(&self) -> impl Iterator<Item = &V> {
         self.iter().map(|(_, v)| v)
@@ -56,20 +67,22 @@ impl<V: Clone> Map<V> {
     pub fn after(&self, key: u64) -> impl Iterator<Item = (&u64, &V)> {
         self.chunks
             .range(key / 256..)
-            .flat_map(|(_, c)| c.iter())
+            .flat_map(|(_, c)| c.iter().map(|(k, v)| (k, v)))
             .filter(move |(k, _)| **k > key)
     }
 }
 impl<V: Clone + Default> Map<V> {
     pub fn get_or_default(&mut self, key: u64) -> &mut V {
         let chunk = Arc::make_mut(self.chunks.entry(key / 256).or_default());
-        match chunk.entry(key) {
-            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::btree_map::Entry::Vacant(e) => {
+        let index = match chunk.binary_search_by_key(&key, |(k, _)| *k) {
+            Ok(index) => index,
+            Err(index) => {
+                chunk.insert(index, (key, V::default()));
                 self.len += 1;
-                e.insert(V::default())
+                index
             }
-        }
+        };
+        &mut chunk[index].1
     }
 }
 impl<V: Clone> FromIterator<(u64, V)> for Map<V> {
@@ -267,6 +280,73 @@ mod tests {
             let mut union = old_pages;
             union.union(&pages);
             assert_eq!(union.len(), old_set.union(&set).count());
+        }
+    }
+}
+
+#[cfg(test)]
+mod map_tests {
+    use super::Map;
+    use std::collections::BTreeMap;
+    #[test]
+    fn compact_chunks_match_reference_and_preserve_cow_views() {
+        let mut map = Map::<u64>::new();
+        let mut expected = BTreeMap::new();
+        let mut seed = 31u64;
+        for round in 0..12 {
+            let pinned = map.clone();
+            let before = expected.clone();
+            for _ in 0..2048 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let key = if seed & 8 == 0 {
+                    u64::MAX - seed % 1024
+                } else {
+                    seed % 4096
+                };
+                match seed % 4 {
+                    0 => assert_eq!(map.remove(&key), expected.remove(&key)),
+                    1 => {
+                        *map.get_or_default(key) += 1;
+                        *expected.entry(key).or_default() += 1;
+                    }
+                    2 => assert_eq!(map.insert(key, seed), expected.insert(key, seed)),
+                    _ => {
+                        if let Some(v) = map.get_mut(&key) {
+                            *v = round;
+                        }
+                        if let Some(v) = expected.get_mut(&key) {
+                            *v = round;
+                        }
+                    }
+                }
+                assert_eq!(map.get(&key), expected.get(&key));
+            }
+            assert_eq!(map.len(), expected.len());
+            assert_eq!(
+                map.iter()
+                    .map(|(&k, &v)| (k, v))
+                    .collect::<BTreeMap<_, _>>(),
+                expected
+            );
+            assert_eq!(
+                pinned
+                    .iter()
+                    .map(|(&k, &v)| (k, v))
+                    .collect::<BTreeMap<_, _>>(),
+                before
+            );
+            for start in [0, 255, 256, 4095, u64::MAX - 512, u64::MAX] {
+                assert_eq!(
+                    map.after(start).map(|(&k, &v)| (k, v)).collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .filter(|(&k, _)| k > start)
+                        .map(|(&k, &v)| (k, v))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
     }
 }

@@ -617,6 +617,7 @@ fn writeback_is_visible_but_not_durable_and_keeps_reader_pins() -> Result<()> {
     core.stage(0, Box::new([1; PAGE]))?;
     core.commit()?;
     let before = core.stats()?.barriers;
+    let metadata_before = core.stats()?.metadata_pages_written;
     core.stage(0, Box::new([2; PAGE]))?;
     core.writeback()?;
     let pinned = core.view();
@@ -625,6 +626,7 @@ fn writeback_is_visible_but_not_durable_and_keeps_reader_pins() -> Result<()> {
         core.writeback()?;
     }
     assert_eq!(core.stats()?.barriers, before);
+    assert_eq!(core.stats()?.metadata_pages_written, metadata_before);
     assert_eq!(pinned.read(0)?.unwrap()[0], 2);
     assert_eq!(core.read_block(0)?.unwrap()[0], 19);
     let uncommitted = disk.0.lock().unwrap().clone();
@@ -796,5 +798,35 @@ fn metadata_cache_collision_and_reuse_never_return_stale_pages() -> Result<()> {
     cache.invalidate(2);
     disk.write(2 * PAGE as u64, &[0; PAGE])?;
     assert!(cache.read(&disk, 2, 3).is_err());
+    Ok(())
+}
+
+#[test]
+fn deferred_metadata_merges_shared_objects_overwrites_and_zeroes() -> Result<()> {
+    let disk = Arc::new(Model::default());
+    let mut core = Core::create(disk.clone(), PAGE as u64 * 1024, policy(Codec::Lz4, true))?;
+    let mut expected = vec![0u8; 1024];
+    for generation in 1..=8u8 {
+        for (lba, value) in expected.iter_mut().enumerate() {
+            // Shared objects, transitions back to zero, and objects born and
+            // retired without ever appearing in a durable tree.
+            *value = if (lba + generation as usize) % 7 == 0 {
+                0
+            } else {
+                generation
+            };
+            core.stage(lba as u64, Box::new([*value; PAGE]))?;
+        }
+        core.writeback()?;
+    }
+    assert_eq!(core.stats()?.metadata_pages_written, 0);
+    core.commit()?;
+    assert_eq!(core.stats()?.barriers, 2);
+    drop(core);
+    disk.cut(0, false);
+    let core = Core::open(disk, policy(Codec::None, false))?;
+    for (lba, value) in expected.into_iter().enumerate() {
+        assert_eq!(*core.read_block(lba as u64)?.unwrap(), [value; PAGE]);
+    }
     Ok(())
 }
