@@ -973,3 +973,108 @@ fn asynchronous_publication_protects_frozen_root_during_next_writeback() -> Resu
     }
     Ok(())
 }
+
+#[test]
+fn asynchronous_punch_reserves_ranges_without_stalling_flush_and_poison_on_error() -> Result<()> {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Condvar,
+    };
+    #[derive(Default)]
+    struct HeldPunch {
+        disk: Model,
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+        fail: AtomicBool,
+    }
+    impl Disk for HeldPunch {
+        fn read(&self, o: u64, b: &mut [u8]) -> Result<()> {
+            self.disk.read(o, b)
+        }
+        fn write(&self, o: u64, b: &[u8]) -> Result<()> {
+            self.disk.write(o, b)
+        }
+        fn barrier(&self) -> Result<()> {
+            self.disk.barrier()
+        }
+        fn len(&self) -> Result<u64> {
+            self.disk.len()
+        }
+        fn allocated(&self) -> Result<u64> {
+            self.disk.allocated()
+        }
+        fn punch(&self, o: u64, n: u64) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).unwrap();
+            }
+            drop(state);
+            if self.fail.load(Ordering::Relaxed) {
+                bail!("injected punch EIO");
+            }
+            self.disk.punch(o, n)
+        }
+    }
+    struct Release(Arc<HeldPunch>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.state.lock().unwrap().1 = true;
+            self.0.changed.notify_all();
+        }
+    }
+    for fail in [false, true] {
+        let disk = Arc::new(HeldPunch::default());
+        let mut c = Core::create(disk.clone(), 256 * PAGE as u64, policy(Codec::None, false))?;
+        let release = Release(disk.clone());
+        for generation in 1..=3 {
+            for lba in 0..256 {
+                c.stage(lba, Box::new([generation; PAGE]))?;
+            }
+            c.commit()?;
+        }
+        let (wake, _rx) = std::sync::mpsc::sync_channel(1);
+        // Root rotation is also asynchronous. Retired data becomes eligible
+        // only after both recoverable roots have moved away from it.
+        for _ in 0..4 {
+            c.maintenance_async(wake.clone(), || false)?;
+            if c.stats()?.cleaner_pending_bytes > 0 {
+                break;
+            }
+            c.finish_publication(true)?;
+        }
+        assert!(c.stats()?.cleaner_pending_bytes > 0);
+        let state = disk.state.lock().unwrap();
+        let (state, timeout) = disk
+            .changed
+            .wait_timeout_while(state, std::time::Duration::from_secs(5), |s| !s.0)
+            .unwrap();
+        assert!(!timeout.timed_out());
+        drop(state);
+        // No cleaner completion exists yet. Commit must still complete, and its
+        // allocator must not reuse any reserved hole that the punch will erase.
+        for lba in 0..256 {
+            c.stage(lba, Box::new([19; PAGE]))?;
+        }
+        c.commit()?;
+        for lba in 0..256 {
+            assert_eq!(*c.read_block(lba)?.unwrap(), [19; PAGE]);
+        }
+        disk.fail.store(fail, Ordering::Relaxed);
+        drop(release);
+        if fail {
+            assert!(c.finish_cleaning(true).is_err());
+            assert!(c.stage(0, Box::new([23; PAGE])).is_err());
+            assert!(c.commit().is_err());
+        } else {
+            assert!(c.finish_cleaning(true)?);
+        }
+        drop(c);
+        let reopened = Core::open(disk, policy(Codec::None, false))?;
+        for lba in 0..256 {
+            assert_eq!(*reopened.read_block(lba)?.unwrap(), [19; PAGE]);
+        }
+    }
+    Ok(())
+}

@@ -19,6 +19,10 @@ impl<V: Clone> Map<V> {
     pub fn len(&self) -> usize {
         self.len
     }
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+        self.len = 0;
+    }
     pub fn get(&self, key: &u64) -> Option<&V> {
         let chunk = self.chunks.get(&(key / 256))?;
         let index = chunk.binary_search_by_key(key, |(k, _)| *k).ok()?;
@@ -42,6 +46,34 @@ impl<V: Clone> Map<V> {
                 None
             }
         }
+    }
+    // Input is sorted and unique (a drained dirty map or object-ID batch).
+    // Acquire/COW each chunk once; sequential additions need no binary search.
+    pub fn replace_sorted(&mut self, values: &[(u64, V)]) -> Vec<Option<V>> {
+        debug_assert!(values.windows(2).all(|w| w[0].0 < w[1].0));
+        let mut old = Vec::with_capacity(values.len());
+        for group in values.chunk_by(|a, b| a.0 / 256 == b.0 / 256) {
+            let chunk = Arc::make_mut(self.chunks.entry(group[0].0 / 256).or_default());
+            for (key, value) in group {
+                if chunk.last().is_none_or(|(last, _)| last < key) {
+                    chunk.push((*key, value.clone()));
+                    self.len += 1;
+                    old.push(None);
+                } else {
+                    match chunk.binary_search_by_key(key, |(k, _)| *k) {
+                        Ok(index) => {
+                            old.push(Some(std::mem::replace(&mut chunk[index].1, value.clone())))
+                        }
+                        Err(index) => {
+                            chunk.insert(index, (*key, value.clone()));
+                            self.len += 1;
+                            old.push(None);
+                        }
+                    }
+                }
+            }
+        }
+        old
     }
     pub fn remove(&mut self, key: &u64) -> Option<V> {
         let chunk = self.chunks.get_mut(&(key / 256))?;
@@ -83,6 +115,13 @@ impl<V: Clone + Default> Map<V> {
             }
         };
         &mut chunk[index].1
+    }
+}
+impl<V: Clone> Extend<(u64, V)> for Map<V> {
+    fn extend<T: IntoIterator<Item = (u64, V)>>(&mut self, values: T) {
+        for (key, value) in values {
+            self.insert(key, value);
+        }
     }
 }
 impl<V: Clone> FromIterator<(u64, V)> for Map<V> {
@@ -288,6 +327,41 @@ mod tests {
 mod map_tests {
     use super::Map;
     use std::collections::BTreeMap;
+    #[test]
+    fn sorted_batches_preserve_previous_values_and_pinned_chunks() {
+        let mut map = Map::new();
+        let mut reference = BTreeMap::new();
+        for pass in 0..8 {
+            let pinned = map.clone();
+            let old = reference.clone();
+            let values: BTreeMap<_, _> = (0..2048)
+                .map(|i| {
+                    let k = ((i * 193 + pass * 67) % 4096) as u64;
+                    (if i % 17 == 0 { u64::MAX - k } else { k }, pass)
+                })
+                .collect();
+            let values: Vec<_> = values.into_iter().collect();
+            let previous: Vec<_> = values
+                .iter()
+                .map(|&(k, v)| reference.insert(k, v))
+                .collect();
+            assert_eq!(map.replace_sorted(&values), previous);
+            assert_eq!(map.len(), reference.len());
+            assert_eq!(
+                map.iter()
+                    .map(|(&k, &v)| (k, v))
+                    .collect::<BTreeMap<_, _>>(),
+                reference
+            );
+            assert_eq!(
+                pinned
+                    .iter()
+                    .map(|(&k, &v)| (k, v))
+                    .collect::<BTreeMap<_, _>>(),
+                old
+            );
+        }
+    }
     #[test]
     fn compact_chunks_match_reference_and_preserve_cow_views() {
         let mut map = Map::<u64>::new();

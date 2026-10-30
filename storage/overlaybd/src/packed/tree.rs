@@ -88,13 +88,26 @@ impl Cache {
 }
 // Logical mappings only need an object ID in memory. Expand to the existing
 // six-word disk value only when serializing a durable generation.
-pub fn update_mappings(a: &mut impl Pages, root: u64, changes: &BTreeMap<u64, u64>) -> Result<u64> {
+pub fn update_mappings(
+    a: &mut impl Pages,
+    root: u64,
+    changes: &super::memory::Map<u64>,
+) -> Result<u64> {
     let changes: Vec<_> = changes
         .iter()
         .map(|(&key, &id)| (key, Some([id, 0, 0, 0, 0, 0])))
         .collect();
     update_sorted(a, root, HEIGHT, &changes)
 }
+pub fn update_objects(
+    a: &mut impl Pages,
+    root: u64,
+    changes: &super::memory::Map<Option<Value>>,
+) -> Result<u64> {
+    let changes: Vec<_> = changes.iter().map(|(&key, &value)| (key, value)).collect();
+    update_sorted(a, root, HEIGHT, &changes)
+}
+#[cfg(test)]
 pub fn update(
     a: &mut impl Pages,
     root: u64,

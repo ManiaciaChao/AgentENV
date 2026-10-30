@@ -38,6 +38,7 @@ impl Default for Policy {
 pub struct Stats {
     pub generations: u64,
     pub writeback_batches: u64,
+    pub prefetched_batches: u64,
     pub writeback_ns: u64,
     pub barriers: u64,
     pub barrier_ns: u64,
@@ -53,7 +54,11 @@ pub struct Stats {
     pub metadata_ns: u64,
     pub encoding_wait_ns: u64,
     pub payload_io_ns: u64,
+    pub metadata_io_ns: u64,
+    pub data_queue_wait_ns: u64,
     pub publication_ns: u64,
+    pub cleaner_ns: u64,
+    pub cleaner_pending_bytes: u64,
     pub metadata_cache_hits: u64,
     pub metadata_cache_misses: u64,
     pub bookkeeping_ns: u64,
@@ -194,7 +199,8 @@ struct Allocation {
     disk: Arc<dyn Disk>,
     free: BTreeSet<u64>,
     end: u64,
-    pack: Option<(u64, [u8; PAGE], usize)>,
+    // The open packing page is the last page of output, never a separate copy.
+    pack: Option<(u64, usize)>,
     metadata: u64,
     cache: tree::Cache,
     created: BTreeSet<u64>,
@@ -205,6 +211,9 @@ struct Allocation {
     write_calls: u64,
     write_bytes: u64,
     io_ns: u64,
+    metadata_io_ns: u64,
+    queue_wait_ns: u64,
+    writer: super::writeback::Writer,
 }
 impl Pages for Allocation {
     fn allocate(&mut self) -> u64 {
@@ -245,16 +254,25 @@ impl Allocation {
     }
     fn flush_data(&mut self) -> Result<()> {
         if !self.output.is_empty() {
-            let started = Instant::now();
-            self.disk.write(self.output_offset, &self.output)?;
-            self.io_ns += started.elapsed().as_nanos() as u64;
             self.write_calls += 1;
             self.write_bytes += self.output.len() as u64;
-            self.output.clear();
+            self.output = self.writer.submit(
+                self.output_offset,
+                std::mem::take(&mut self.output),
+                self.metadata != 0,
+            )?;
         }
         Ok(())
     }
-    fn data_page(&mut self, page: u64, data: &[u8; PAGE]) -> Result<()> {
+    fn finish_io(&mut self) -> Result<()> {
+        let timings = self.writer.finish()?;
+        self.io_ns += timings.data_ns;
+        self.metadata_io_ns += timings.metadata_ns;
+        self.queue_wait_ns += timings.wait_ns;
+        Ok(())
+    }
+    fn start_page(&mut self, page: u64) -> Result<()> {
+        debug_assert!(self.pack.is_none());
         let offset = page * PAGE as u64;
         if !self.output.is_empty()
             && (self.output_offset + self.output.len() as u64 != offset
@@ -265,29 +283,95 @@ impl Allocation {
         if self.output.is_empty() {
             self.output_offset = offset;
         }
+        Ok(())
+    }
+    fn data_page(&mut self, page: u64, data: &[u8; PAGE]) -> Result<()> {
+        self.start_page(page)?;
         self.output.extend_from_slice(data);
         Ok(())
     }
-    fn finish_pack(&mut self) -> Result<()> {
-        if let Some((p, b, _)) = self.pack.take() {
-            self.data_page(p, &b)?;
-        }
+    fn packing_page(&mut self, page: u64) -> Result<()> {
+        self.start_page(page)?;
+        self.output.resize(self.output.len() + PAGE, 0);
+        self.pack = Some((page, 0));
         Ok(())
+    }
+    fn finish_pack(&mut self) -> Result<()> {
+        // Padding already exists in the output buffer. Once closed, this page
+        // is immutable; start_page may send it to disk while opening the next.
+        self.pack = None;
+        Ok(())
+    }
+
+    // Compression workers already laid out independent objects at 64-byte
+    // boundaries. Reserve one contiguous run and copy/write the whole batch.
+    // Fragmented free space uses the per-object path instead of growing forever
+    // while ignoring reusable holes. Search work is bounded per batch.
+    fn packed_batch(&mut self, bytes: &[u8]) -> Result<Option<u64>> {
+        if bytes.is_empty() {
+            return Ok(Some(0));
+        }
+        ensure!(
+            bytes.len() % PAGE == 0 && bytes.len() as u64 <= SEGMENT,
+            "invalid packed batch"
+        );
+        let count = (bytes.len() / PAGE) as u64;
+        let start = if self.free.is_empty() {
+            let pages_per_segment = SEGMENT / PAGE as u64;
+            if self.end % pages_per_segment + count > pages_per_segment {
+                self.end = (self.end / pages_per_segment + 1) * pages_per_segment;
+            }
+            if self.excluded == Some(self.end / pages_per_segment) {
+                self.end += pages_per_segment - self.end % pages_per_segment;
+            }
+            let start = self.end;
+            self.end += count;
+            start
+        } else {
+            let mut run = 0;
+            let mut start = 0;
+            let mut found = None;
+            for &page in self.free.iter().take(4096) {
+                if run == 0
+                    || page != start + run
+                    || page * PAGE as u64 / SEGMENT != start * PAGE as u64 / SEGMENT
+                {
+                    start = page;
+                    run = 0;
+                }
+                run += 1;
+                if run == count {
+                    found = Some(start);
+                    break;
+                }
+            }
+            let Some(start) = found else {
+                return Ok(None);
+            };
+            for page in start..start + count {
+                self.free.remove(&page);
+                self.cache.invalidate(page);
+            }
+            start
+        };
+        self.finish_pack()?;
+        if self.output.len() + bytes.len() > 1024 * 1024 {
+            self.flush_data()?;
+        }
+        self.start_page(start)?;
+        self.output.extend_from_slice(bytes);
+        Ok(Some(start * PAGE as u64))
     }
 
     fn payload(&mut self, b: &[u8]) -> Result<u64> {
         let n = b.len().next_multiple_of(64);
-        if self
-            .pack
-            .as_ref()
-            .is_some_and(|(_, _, used)| *used == PAGE || n == PAGE)
-        {
+        if self.pack.is_some_and(|(_, used)| used == PAGE || n == PAGE) {
             self.finish_pack()?;
         }
-        if let Some((p, _, used)) = &self.pack {
+        if let Some((p, used)) = self.pack {
             if used + n > PAGE {
                 let next = p + 1;
-                let contiguous = (*p * PAGE as u64 / SEGMENT == next * PAGE as u64 / SEGMENT)
+                let contiguous = (p * PAGE as u64 / SEGMENT == next * PAGE as u64 / SEGMENT)
                     && self.excluded != Some(next * PAGE as u64 / SEGMENT)
                     && (self.free.contains(&next) || next == self.end);
                 if contiguous {
@@ -295,27 +379,29 @@ impl Allocation {
                     if !self.free.remove(&next) {
                         self.end += 1;
                     }
-                    let (page, mut data, used) = self.pack.take().unwrap();
                     let first = PAGE - used;
-                    data[used..].copy_from_slice(&b[..first]);
-                    self.data_page(page, &data)?;
-                    let mut tail = [0; PAGE];
-                    tail[..b.len() - first].copy_from_slice(&b[first..]);
-                    self.pack = Some((next, tail, n - first));
-                    return Ok(page * PAGE as u64 + used as u64);
+                    let at = self.output.len() - PAGE + used;
+                    self.output[at..].copy_from_slice(&b[..first]);
+                    self.finish_pack()?;
+                    self.packing_page(next)?;
+                    let at = self.output.len() - PAGE;
+                    self.output[at..at + b.len() - first].copy_from_slice(&b[first..]);
+                    self.pack = Some((next, n - first));
+                    return Ok(p * PAGE as u64 + used as u64);
                 }
                 self.finish_pack()?;
             }
         }
         if self.pack.is_none() {
             let p = self.page();
-            self.pack = Some((p, [0; PAGE], 0));
+            self.packing_page(p)?;
         }
-        let (p, page, used) = self.pack.as_mut().unwrap();
-        let at = *p * PAGE as u64 + *used as u64;
-        page[*used..*used + b.len()].copy_from_slice(b);
+        let (p, used) = self.pack.as_mut().unwrap();
+        let offset = *p * PAGE as u64 + *used as u64;
+        let at = self.output.len() - PAGE + *used;
+        self.output[at..at + b.len()].copy_from_slice(b);
         *used += n;
-        Ok(at)
+        Ok(offset)
     }
 }
 
@@ -389,6 +475,10 @@ struct Publication {
     blocks: u64,
     done: std::sync::mpsc::Receiver<super::publish::Outcome>,
 }
+struct Punching {
+    pages: Vec<u64>,
+    done: std::sync::mpsc::Receiver<(Result<()>, u64, u64, u64)>,
+}
 pub struct Core {
     disk: Arc<dyn Disk>,
     roots: [Option<Arc<Root>>; 2],
@@ -397,16 +487,22 @@ pub struct Core {
     working_blocks: u64,
     // Deltas relative to the latest durable trees. Working reads use Root's
     // in-memory indexes; capacity writeback does not serialize these trees.
-    map_delta: BTreeMap<u64, u64>,
-    object_delta: BTreeMap<u64, Option<Value>>,
+    map_delta: Map<u64>,
+    object_delta: Map<Option<Value>>,
     pub policy: Policy,
-    pub pending: BTreeMap<u64, Arc<[u8; PAGE]>>,
+    pub pending: Arc<BTreeMap<u64, Arc<[u8; PAGE]>>>,
     poison: Arc<std::sync::Mutex<Option<String>>>,
     dedupe: HashMap<[u8; 32], u64>,
     encoders: super::encode::Pool,
+    pub prepared: Option<super::encode::Encoding>,
     publisher: Option<super::publish::Publisher>,
     publication: Option<Publication>,
+    cleaner: Option<super::cleaner::Cleaner>,
+    punching: Option<Punching>,
+    cleaner_rotate: bool,
     tree_cache: tree::Cache,
+    output_buffer: Vec<u8>,
+    data_writer: Option<super::writeback::Writer>,
     punched: BTreeSet<u64>,
     warm_cursor: u64,
     readers: Vec<Weak<Root>>,
@@ -438,16 +534,22 @@ impl Core {
             current: 0,
             working: None,
             working_blocks: 0,
-            map_delta: BTreeMap::new(),
-            object_delta: BTreeMap::new(),
+            map_delta: Map::new(),
+            object_delta: Map::new(),
             policy,
-            pending: BTreeMap::new(),
+            pending: Arc::new(BTreeMap::new()),
             poison: Arc::new(std::sync::Mutex::new(None)),
             dedupe: HashMap::new(),
             encoders: super::encode::Pool::default(),
+            prepared: None,
             publisher: None,
             publication: None,
+            cleaner: None,
+            punching: None,
+            cleaner_rotate: false,
             tree_cache: tree::Cache::default(),
+            output_buffer: Vec::new(),
+            data_writer: None,
             punched: BTreeSet::new(),
             warm_cursor: 0,
             readers: Vec::new(),
@@ -484,16 +586,22 @@ impl Core {
             current,
             working: None,
             working_blocks: 0,
-            map_delta: BTreeMap::new(),
-            object_delta: BTreeMap::new(),
+            map_delta: Map::new(),
+            object_delta: Map::new(),
             policy,
-            pending: BTreeMap::new(),
+            pending: Arc::new(BTreeMap::new()),
             poison: Arc::new(std::sync::Mutex::new(None)),
             dedupe: HashMap::new(),
             encoders: super::encode::Pool::default(),
+            prepared: None,
             publisher: None,
             publication: None,
+            cleaner: None,
+            punching: None,
+            cleaner_rotate: false,
             tree_cache: tree::Cache::default(),
+            output_buffer: Vec::new(),
+            data_writer: None,
             punched: BTreeSet::new(),
             warm_cursor: 0,
             readers: Vec::new(),
@@ -566,10 +674,10 @@ impl Core {
             lba < self.size().div_ceil(PAGE as u64),
             "packed write outside volume"
         );
-        self.pending.insert(lba, b.into());
+        Arc::make_mut(&mut self.pending).insert(lba, b.into());
         Ok(())
     }
-    fn protected(&self) -> PageSet {
+    fn protected_roots(&self) -> PageSet {
         let mut protected: PageSet = [0, 1].into_iter().collect();
         for root in self
             .roots
@@ -581,6 +689,13 @@ impl Core {
             .chain(self.readers.iter().filter_map(Weak::upgrade))
         {
             protected.union(&root.pages);
+        }
+        protected
+    }
+    fn protected(&self) -> PageSet {
+        let mut protected = self.protected_roots();
+        if let Some(punching) = &self.punching {
+            protected.extend(punching.pages.iter().copied());
         }
         protected
     }
@@ -736,6 +851,8 @@ impl Core {
             .holes(end)
             .filter(|p| victim != Some(*p * PAGE as u64 / SEGMENT))
             .collect();
+        let mut output = std::mem::take(&mut self.output_buffer);
+        output.reserve(1024 * 1024);
         let mut a = Allocation {
             disk: self.disk.clone(),
             free,
@@ -746,19 +863,31 @@ impl Core {
             created: BTreeSet::new(),
             retired: BTreeSet::new(),
             excluded: victim,
-            output: Vec::with_capacity(1024 * 1024),
+            output,
             output_offset: 0,
             write_calls: 0,
             write_bytes: 0,
             io_ns: 0,
+            metadata_io_ns: 0,
+            queue_wait_ns: 0,
+            writer: match self.data_writer.take() {
+                Some(writer) => writer,
+                None => super::writeback::Writer::new(self.disk.clone(), self.poison.clone())?,
+            },
         };
         self.stats.prepare_ns += prepare_started.elapsed().as_nanos() as u64;
         let objects_started = Instant::now();
-        let (mut maps, mut objects) = (Vec::new(), BTreeMap::new());
+        let (mut maps, mut objects) = (Vec::new(), Map::new());
         let pending = self.pending.clone();
         let mut fresh: HashMap<[u8; 32], (u64, Arc<[u8; PAGE]>)> = HashMap::new();
         let encoding_started = Instant::now();
-        let mut batches = self.encoders.encode(&pending, self.policy)?;
+        let mut batches = match self.prepared.take() {
+            Some(prepared) => {
+                self.stats.prefetched_batches += 1;
+                prepared
+            }
+            None => self.encoders.encode(&pending, self.policy)?,
+        };
         self.stats.encoding_wait_ns += encoding_started.elapsed().as_nanos() as u64;
         loop {
             let waiting = Instant::now();
@@ -766,6 +895,13 @@ impl Core {
             self.stats.encoding_wait_ns += waiting.elapsed().as_nanos() as u64;
             let Some(batch) = batch else { break };
             let batch = batch?;
+            let packed_at = if batch.packed {
+                a.packed_batch(&batch.bytes)?
+            } else {
+                None
+            };
+            let batch_start = maps.len();
+            let mut new_objects = Vec::with_capacity(batch.blocks.len());
             for encoded in &batch.blocks {
                 let lba = &encoded.lba;
                 let b = &encoded.plain;
@@ -808,28 +944,44 @@ impl Core {
                         } else {
                             &batch.bytes[encoded.offset..encoded.offset + encoded.len]
                         };
-                        let offset = a.payload(bytes)?;
+                        let offset = match packed_at {
+                            Some(start) => start + encoded.offset as u64,
+                            None => a.payload(bytes)?,
+                        };
                         let value = [offset, bytes.len() as u64, codec, encoded.crc, 1, 0];
-                        next.objects.insert(id, value);
-                        objects.insert(id, Some(value));
                         if self.policy.dedupe {
+                            next.objects.insert(id, value);
+                            objects.insert(id, Some(value));
                             fresh.insert(hash, (id, b.clone()));
+                        } else {
+                            new_objects.push((id, value));
                         }
                         id
                     }
                 };
-                if let Some(old) = next.map.insert(*lba, id) {
-                    if old != 0 {
-                        let v = next
-                            .objects
-                            .get_mut(&old)
-                            .context("packed old object missing")?;
-                        ensure!(v[4] > 0, "packed reference underflow");
-                        v[4] -= 1;
-                        objects.insert(old, Some(*v));
-                    }
-                }
                 maps.push((*lba, id));
+            }
+            next.objects.replace_sorted(&new_objects);
+            let changes: Vec<_> = new_objects
+                .into_iter()
+                .map(|(id, v)| (id, Some(v)))
+                .collect();
+            objects.replace_sorted(&changes);
+            for old in next
+                .map
+                .replace_sorted(&maps[batch_start..])
+                .into_iter()
+                .flatten()
+            {
+                if old != 0 {
+                    let v = next
+                        .objects
+                        .get_mut(&old)
+                        .context("packed old object missing")?;
+                    ensure!(v[4] > 0, "packed reference underflow");
+                    v[4] -= 1;
+                    objects.insert(old, Some(*v));
+                }
             }
         }
         let dead: Vec<_> = objects
@@ -861,28 +1013,35 @@ impl Core {
         a.finish_pack()?;
         a.flush_data()?;
         self.stats.objects_and_data_ns += objects_started.elapsed().as_nanos() as u64;
-        self.stats.payload_io_ns += a.io_ns;
         let data_write_calls = a.write_calls;
         let data_write_bytes = a.write_bytes;
         let metadata_started = Instant::now();
-        self.map_delta.extend(maps);
+        self.map_delta.replace_sorted(&maps);
         let durable_next_id = self.metadata_base().next_id;
-        for (&key, &value) in &objects {
+        let mut changes = Vec::with_capacity(objects.len());
+        for (&key, &value) in objects.iter() {
             if value.is_none() && key >= durable_next_id {
                 // Born and retired within this generation: never serialize it.
                 self.object_delta.remove(&key);
             } else {
-                self.object_delta.insert(key, value);
+                changes.push((key, value));
             }
         }
+        self.object_delta.replace_sorted(&changes);
         if durable {
             next.map_root = tree::update_mappings(&mut a, next.map_root, &self.map_delta)?;
             next.objects_root =
-                tree::update(&mut a, next.objects_root, tree::HEIGHT, &self.object_delta)?;
+                tree::update_objects(&mut a, next.objects_root, &self.object_delta)?;
         }
         // Only immutable old tree nodes are read during the COW traversal.
         // New nodes may be coalesced, but must reach the file before barrier one.
         a.flush_data()?;
+        // Both payload and COW metadata must complete before root exposure and
+        // before either publication barrier. No reader can observe queued data.
+        a.finish_io()?;
+        self.stats.payload_io_ns += a.io_ns;
+        self.stats.metadata_io_ns += a.metadata_io_ns;
+        self.stats.data_queue_wait_ns += a.queue_wait_ns;
         self.stats.metadata_write_calls += a.write_calls - data_write_calls;
         self.stats.metadata_ns += metadata_started.elapsed().as_nanos() as u64;
         let slot = 1 - self.current;
@@ -895,7 +1054,7 @@ impl Core {
         // Volatile working views never replace either recoverable root.
         // Update only changed object extents. Shared packed pages remain live
         // until their last distinct object has gone, independent of dedupe refs.
-        for (&id, new) in &objects {
+        for (&id, new) in objects.iter() {
             let old = self.root().objects.get(&id);
             if let Some(v) = old {
                 next.encoded_bytes -= v[1];
@@ -979,7 +1138,7 @@ impl Core {
             self.working = Some(Arc::new(next));
         }
         self.readers.retain(|r| r.strong_count() > 0);
-        self.pending.clear();
+        self.pending = Arc::new(BTreeMap::new());
         if self.policy.dedupe {
             for (h, (id, _)) in fresh {
                 if self.dedupe.len() >= 262144 {
@@ -992,6 +1151,8 @@ impl Core {
         self.stats.metadata_cache_hits = a.cache.hits;
         self.stats.metadata_cache_misses = a.cache.misses;
         self.tree_cache = a.cache;
+        self.output_buffer = a.output;
+        self.data_writer = Some(a.writer);
         self.stats.bookkeeping_ns += bookkeeping_started.elapsed().as_nanos() as u64;
         Ok(())
     }
@@ -1021,13 +1182,60 @@ impl Core {
     }
     pub fn maintenance_interruptible(&mut self, should_yield: impl Fn() -> bool) -> Result<()> {
         self.check()?;
-        let r = self.maintenance_inner(&should_yield);
+        self.finish_cleaning(true)?;
+        let r = self.maintenance_inner(&should_yield, None);
         if let Err(e) = &r {
             *self.poison.lock().unwrap() = Some(format!("{e:#}"));
         }
         r
     }
-    fn maintenance_inner(&mut self, should_yield: &impl Fn() -> bool) -> Result<()> {
+    pub fn maintenance_async(
+        &mut self,
+        wake: std::sync::mpsc::SyncSender<()>,
+        should_yield: impl Fn() -> bool,
+    ) -> Result<()> {
+        self.check()?;
+        let result = self.maintenance_inner(&should_yield, Some(wake));
+        if let Err(error) = &result {
+            *self.poison.lock().unwrap() = Some(format!("{error:#}"));
+        }
+        result
+    }
+    pub fn finish_cleaning(&mut self, wait: bool) -> Result<bool> {
+        let Some(punching) = &self.punching else {
+            return Ok(false);
+        };
+        let outcome = if wait {
+            punching.done.recv().map_err(|error| {
+                *self.poison.lock().unwrap() = Some(format!("packed cleaner exited: {error}"));
+                anyhow::anyhow!("packed cleaner exited: {error}")
+            })?
+        } else {
+            match punching.done.try_recv() {
+                Ok(outcome) => outcome,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(error) => {
+                    *self.poison.lock().unwrap() = Some(format!("packed cleaner exited: {error}"));
+                    return Err(error.into());
+                }
+            }
+        };
+        let punching = self.punching.take().unwrap();
+        self.stats.cleaner_ns += outcome.1;
+        self.stats.barrier_ns += outcome.2;
+        // Count attempted barriers, including failures. A punch failure can
+        // occur before any barrier. The worker poisons before sending errors.
+        self.stats.barriers += outcome.3;
+        outcome.0?;
+        self.stats.reclaimed_bytes += punching.pages.len() as u64 * PAGE as u64;
+        self.punched.extend(punching.pages);
+        Ok(true)
+    }
+    fn maintenance_inner(
+        &mut self,
+        should_yield: &impl Fn() -> bool,
+        wake: Option<std::sync::mpsc::SyncSender<()>>,
+    ) -> Result<()> {
         if self.publication.is_some()
             || !self.pending.is_empty()
             || self.working.is_some()
@@ -1036,7 +1244,7 @@ impl Core {
             return Ok(());
         }
         let end = self.disk.len()?.div_ceil(PAGE as u64);
-        let protected = self.protected();
+        let protected = self.protected_roots();
         // Dual roots ARE the persistent retirement ledger: a page stays quarantined
         // until neither recoverable root references it. Reopen reconstructs this set.
         let latest = &self.root().pages;
@@ -1045,8 +1253,37 @@ impl Core {
         let used = latest.len() as u64 * PAGE as u64;
         let data_bytes = self.root().data_counts.len() as u64 * PAGE as u64;
         let fragmented = data_bytes.saturating_sub(live);
-        if retired >= 8 * 1024 * 1024 || retired * 10 >= used.max(PAGE as u64) * 3 {
+        let free_bytes = end
+            .saturating_sub(protected.len() as u64)
+            .saturating_sub(self.punched.len() as u64)
+            * PAGE as u64;
+        let invalid = retired
+            .saturating_add(fragmented)
+            .saturating_add(free_bytes);
+        let allocated = end.saturating_sub(self.punched.len() as u64) * PAGE as u64;
+        // Small reusable holes do not justify a punch + full durability barrier.
+        // Reuse remains available to foreground allocation below this threshold.
+        if !self.cleaner_rotate
+            && invalid < 8 * 1024 * 1024
+            && invalid.saturating_mul(10) < allocated.max(PAGE as u64).saturating_mul(3)
+        {
+            self.warm_dedupe(32)?;
+            return Ok(());
+        }
+        let rotation_can_release_pages = self.roots[1 - self.current]
+            .as_ref()
+            .is_some_and(|root| root.pages.difference_count(latest) != 0);
+        if self.cleaner_rotate
+            || (rotation_can_release_pages
+                && (retired >= 8 * 1024 * 1024 || retired * 10 >= used.max(PAGE as u64) * 3))
+        {
+            if let Some(wake) = wake {
+                self.run_publish(None, true, Some(wake))?;
+                self.cleaner_rotate = false;
+                return Ok(());
+            }
             self.publish(true, None)?;
+            self.cleaner_rotate = false;
             if should_yield() {
                 return Ok(());
             }
@@ -1068,6 +1305,11 @@ impl Core {
                 if should_yield() {
                     return Ok(());
                 }
+                if let Some(wake) = wake {
+                    self.run_publish(Some(seg), true, Some(wake))?;
+                    self.cleaner_rotate = true;
+                    return Ok(());
+                }
                 self.publish(true, Some(seg))?;
                 if should_yield() {
                     return Ok(());
@@ -1075,11 +1317,64 @@ impl Core {
                 self.publish(true, None)?;
             }
         }
+        if self.punching.is_some() {
+            return Ok(());
+        }
         let protected = self.protected();
         let free: Vec<_> = protected
             .holes(end)
             .filter(|p| !self.punched.contains(p))
+            .take(if wake.is_some() { 4096 } else { usize::MAX })
             .collect();
+        if let Some(wake) = wake {
+            if !free.is_empty() {
+                if self.cleaner.is_none() {
+                    self.cleaner = Some(super::cleaner::Cleaner::new()?);
+                }
+                let (tx, done) = std::sync::mpsc::channel();
+                let pages = free.clone();
+                let disk = self.disk.clone();
+                let poison = self.poison.clone();
+                self.cleaner.as_ref().unwrap().submit(move || {
+                    let started = Instant::now();
+                    let mut barrier_ns = 0;
+                    let mut barriers = 0;
+                    let result = (|| {
+                        let mut i = 0;
+                        while i < pages.len() {
+                            let start = pages[i];
+                            let mut n = 1;
+                            while i + n < pages.len()
+                                && pages[i + n] == start + n as u64
+                                && n < SEGMENT as usize / PAGE
+                            {
+                                n += 1;
+                            }
+                            disk.punch(start * PAGE as u64, n as u64 * PAGE as u64)?;
+                            i += n;
+                        }
+                        let before = Instant::now();
+                        barriers = 1;
+                        let result = disk.barrier();
+                        barrier_ns = before.elapsed().as_nanos() as u64;
+                        result
+                    })();
+                    if let Err(error) = &result {
+                        *poison.lock().unwrap() = Some(format!("{error:#}"));
+                    }
+                    let _ = tx.send((
+                        result,
+                        started.elapsed().as_nanos() as u64,
+                        barrier_ns,
+                        barriers,
+                    ));
+                    let _ = wake.try_send(());
+                })?;
+                self.punching = Some(Punching { pages: free, done });
+            }
+            self.warm_dedupe(32)?;
+            return Ok(());
+        }
         let mut i = 0;
         while i < free.len() {
             if should_yield() {
@@ -1118,7 +1413,12 @@ impl Core {
         s.dirty_bytes = self.pending.len() * PAGE;
         s.live_encoded_bytes = self.root().encoded_bytes;
         let protected = self.protected();
-        s.retired_bytes = protected
+        s.cleaner_pending_bytes = self
+            .punching
+            .as_ref()
+            .map_or(0, |p| p.pages.len() as u64 * PAGE as u64);
+        s.retired_bytes = self
+            .protected_roots()
             .difference_count(&self.root().pages)
             .saturating_sub(2) as u64
             * PAGE as u64;
@@ -1130,5 +1430,90 @@ impl Core {
             .saturating_sub(self.punched.len() as u64))
             * PAGE as u64;
         Ok(s)
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn packed_payloads_cross_pages_and_output_batches_without_rewriting_closed_pages() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let disk = Arc::new(super::super::disk::FileDisk::open(
+            &dir.path().join("pack"),
+            true,
+        )?);
+        // Gaps force noncontiguous output, followed by append allocation across
+        // 1 MiB write boundaries and 2 MiB segment boundaries.
+        let mut a = Allocation {
+            disk: disk.clone(),
+            free: (2..1024).filter(|p| p % 7 != 0).collect(),
+            end: 1024,
+            pack: None,
+            metadata: 0,
+            cache: tree::Cache::default(),
+            created: BTreeSet::new(),
+            retired: BTreeSet::new(),
+            excluded: None,
+            output: Vec::with_capacity(1024 * 1024),
+            output_offset: 0,
+            write_calls: 0,
+            write_bytes: 0,
+            io_ns: 0,
+            metadata_io_ns: 0,
+            queue_wait_ns: 0,
+            writer: super::super::writeback::Writer::new(
+                disk.clone(),
+                Arc::new(std::sync::Mutex::new(None)),
+            )?,
+        };
+        let sizes = [1, 63, 64, 65, 2049, 2050, 4032, 4095, 4096];
+        let mut records = Vec::new();
+        let mut occupied = BTreeSet::new();
+        for i in 0..5000 {
+            let size = sizes[i % sizes.len()];
+            let data = vec![(i % 251 + 1) as u8; size];
+            let offset = a.payload(&data)?;
+            assert_eq!(offset % 64, 0);
+            assert!(offset % SEGMENT + size as u64 <= SEGMENT);
+            for slot in offset / 64..(offset + size as u64).div_ceil(64) {
+                assert!(occupied.insert(slot), "overlapping packed objects");
+            }
+            records.push((offset, data));
+        }
+        a.finish_pack()?;
+        a.flush_data()?;
+        a.finish_io()?;
+        assert!(a.write_calls > 10);
+        for (offset, expected) in records {
+            let mut actual = vec![0; expected.len()];
+            disk.read(offset, &mut actual)?;
+            assert_eq!(actual, expected);
+        }
+        // An append that crosses a segment boundary must also skip an excluded
+        // destination segment, not just check the segment containing its start.
+        a.free.clear();
+        a.end = 8 * SEGMENT / PAGE as u64 - 1;
+        a.excluded = Some(8);
+        let bytes = vec![93; PAGE * 2];
+        let offset = a.packed_batch(&bytes)?.unwrap();
+        assert_eq!(offset, 9 * SEGMENT);
+        a.flush_data()?;
+        a.finish_io()?;
+        let mut actual = vec![0; bytes.len()];
+        disk.read(offset, &mut actual)?;
+        assert_eq!(actual, bytes);
+        // Reuse a sufficiently large hole; leave isolated holes for fallback.
+        a.free = [3, 5, 10, 11].into_iter().collect();
+        assert_eq!(a.packed_batch(&bytes)?, Some(10 * PAGE as u64));
+        assert_eq!(a.packed_batch(&bytes)?, None);
+        assert_eq!(a.free, [3, 5].into_iter().collect());
+        a.flush_data()?;
+        a.finish_io()?;
+        disk.read(10 * PAGE as u64, &mut actual)?;
+        assert_eq!(actual, bytes);
+        Ok(())
     }
 }
