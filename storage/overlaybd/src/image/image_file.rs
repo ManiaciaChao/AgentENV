@@ -11,6 +11,7 @@ use crate::lsmt::file::{
     open_file_rw, open_files_ro_with_premerged_cache, stack_files, CommitArgs, DataStat, LSMTFile,
     LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy, PARALLEL_LOAD_INDEX,
 };
+use crate::packed::PackedUpper;
 use crate::prefetch::{new_prefetcher, PrefetchMode, Prefetcher};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -49,6 +50,7 @@ struct InitializedImageFile {
 enum ImageFileBase {
     ReadOnly(LSMTReadOnlyFile),
     ReadWrite(LSMTFile),
+    Packed(PackedUpper),
 }
 
 impl ImageFileBase {
@@ -56,9 +58,16 @@ impl ImageFileBase {
         matches!(self, Self::ReadOnly(_))
     }
 
+    fn writable_file(&self) -> Option<&dyn VirtualFile> {
+        match self {
+            Self::ReadWrite(f) => Some(f),
+            Self::Packed(f) => Some(f),
+            Self::ReadOnly(_) => None,
+        }
+    }
     fn writable(&self) -> Option<&LSMTFile> {
         match self {
-            Self::ReadOnly(_) => None,
+            Self::ReadOnly(_) | Self::Packed(_) => None,
             Self::ReadWrite(file) => Some(file),
         }
     }
@@ -95,6 +104,7 @@ impl fmt::Debug for ImageFileBase {
         match self {
             Self::ReadOnly(_) => f.write_str("ImageFileBase::ReadOnly(..)"),
             Self::ReadWrite(_) => f.write_str("ImageFileBase::ReadWrite(..)"),
+            Self::Packed(_) => f.write_str("ImageFileBase::Packed(..)"),
         }
     }
 }
@@ -126,6 +136,69 @@ pub struct ImageFile {
 }
 
 impl ImageFile {
+    /// Experimental direct-LBA upper. The caller explicitly chooses this backend;
+    /// ordinary `open` and existing upper formats are unchanged.
+    pub async fn open_packed(
+        config: ImageConfig,
+        image_service: ImageService,
+        policy: crate::packed::Policy,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !config.upper.data.is_empty() && config.upper.index.is_empty(),
+            "packed upper needs one data file and no LSMT index"
+        );
+        let download = config
+            .effective_download(image_service.global_config())
+            .clone();
+        let lowers = Self::open_lowers(
+            &config.lowers,
+            &config.repo_blob_url,
+            &download,
+            download.enable,
+            &image_service,
+            None,
+        )
+        .await?;
+        let file = PackedUpper::open(
+            Path::new(&config.upper.data),
+            lowers.file.map(Arc::new),
+            policy,
+        )
+        .await?;
+        let size = file.size().await?;
+        image_service
+            .submit_bk_downloads(lowers.downloads, None)
+            .await?;
+        let state = LiveImageState {
+            config,
+            base: ImageFileBase::Packed(file),
+            premerged_index_cache_dir: PathBuf::from(
+                &image_service.global_config().cache_config.cache_dir,
+            ),
+            premerged_index_cache_policy: PremergedIndexCachePolicy::hybrid(
+                image_service.global_config().cache_config.cache_size_gb,
+            ),
+        };
+        Ok(Self {
+            state: RwLock::new(state),
+            size_bytes: AtomicU64::new(size),
+            num_lbas: AtomicU64::new(size / 512),
+            block_size: 512,
+            prefetcher: None,
+        })
+    }
+    pub async fn packed_stats(&self) -> Result<Option<crate::packed::Stats>> {
+        match &self.state.read().await.base {
+            ImageFileBase::Packed(file) => Ok(Some(file.stats()?)),
+            _ => Ok(None),
+        }
+    }
+    pub async fn set_packed_policy(&self, policy: crate::packed::Policy) -> Result<()> {
+        match &self.state.read().await.base {
+            ImageFileBase::Packed(file) => file.set_policy(policy).await,
+            _ => bail!("not a packed upper"),
+        }
+    }
     pub async fn open(
         config: ImageConfig,
         image_service: ImageService,
@@ -173,11 +246,24 @@ impl ImageFile {
     /// (`valid_data_size`) and the top layer's physical size
     /// (`total_data_size`). Cheap in-memory index scan; feeds observability
     /// of layer bloat and TRIM headroom.
+    pub async fn compression_write_profile(&self) -> Option<crate::zfile::writable::WriteProfile> {
+        match &self.state.read().await.base {
+            ImageFileBase::ReadWrite(file) => file.compression_write_profile(),
+            ImageFileBase::ReadOnly(_) | ImageFileBase::Packed(_) => None,
+        }
+    }
+    pub async fn vdo_space_usage(&self) -> Result<Option<crate::backend::vdo::SpaceUsage>> {
+        match &self.state.read().await.base {
+            ImageFileBase::ReadWrite(file) => file.vdo_space_usage().await,
+            ImageFileBase::ReadOnly(_) | ImageFileBase::Packed(_) => Ok(None),
+        }
+    }
     pub async fn data_stat(&self) -> Result<DataStat> {
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(file) => Ok(file.data_stat()),
             ImageFileBase::ReadWrite(file) => file.data_stat().await,
+            ImageFileBase::Packed(file) => file.data_stat(),
         }
     }
 
@@ -186,6 +272,7 @@ impl ImageFile {
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.get_uuid(layer_idx),
             ImageFileBase::ReadWrite(file) => file.get_uuid(layer_idx),
+            ImageFileBase::Packed(file) => file.get_uuid(layer_idx),
         }
     }
 
@@ -194,11 +281,15 @@ impl ImageFile {
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.flatten(as_file).await,
             ImageFileBase::ReadWrite(file) => file.flatten(as_file).await,
+            ImageFileBase::Packed(file) => file.flatten(as_file).await,
         }
     }
 
     pub async fn export_upper_as_sealed(&self, args: CommitArgs) -> Result<()> {
         let state = self.state.read().await;
+        if let ImageFileBase::Packed(file) = &state.base {
+            return file.export_upper_as_sealed(args).await;
+        }
         state
             .base
             .writable()
@@ -225,9 +316,20 @@ impl ImageFile {
     pub async fn close_seal(&self, output_layer_path: &Path) -> Result<Option<LayerDescriptor>> {
         // Exclusive rather than shared, unlike `export_upper_as_sealed`: this one
         // modifies the upper it is reading, so no I/O may be in flight beside it.
-        let state = self.state.write().await;
+        let mut state = self.state.write().await;
+        if let ImageFileBase::Packed(current) = &state.base {
+            let exported = Self::export_packed_path(current, output_layer_path).await?;
+            state.base = ImageFileBase::ReadOnly(LSMTReadOnlyFile::open(exported).await?);
+            return Ok(None);
+        }
         ensure_sealable_upper(&state.config.upper, "close_seal")?;
         let upper_data_path = Path::new(&state.config.upper.data);
+        if upper_data_path.try_exists()? {
+            anyhow::ensure!(
+                crate::backend::vdo::capacity(upper_data_path)?.is_none(),
+                "VDO upper must be exported as a standard sealed layer"
+            );
+        }
         let current = state
             .base
             .writable()
@@ -270,6 +372,12 @@ impl ImageFile {
         output_layer_path: &Path,
     ) -> Result<Option<LayerDescriptor>> {
         let mut state = self.state.write().await;
+        if matches!(&state.base, ImageFileBase::Packed(_)) {
+            return self
+                .restack_packed(&mut state, output_layer_path)
+                .await
+                .map_err(into_restack_terminal_failure);
+        }
         let upper_mode = state.config.upper.writable_mode();
         let upper_data_path = PathBuf::from(&state.config.upper.data);
         let upper_index_path = (!state.config.upper.index.is_empty())
@@ -292,6 +400,13 @@ impl ImageFile {
             .writable()
             .context("create_snapshot_and_restack requires a writable image")?;
 
+        if crate::backend::vdo::capacity(&upper_data_path)?.is_some() {
+            return self
+                .restack_vdo(&mut state, output_layer_path)
+                .await
+                .map_err(into_restack_terminal_failure);
+        }
+        let compression = crate::zfile::writable::codec(&upper_data_path)?;
         let virtual_size = self.size_bytes();
         let max_io_size = current.get_max_io_size();
         let group_commit_size = current.get_index_group_commit_size();
@@ -320,11 +435,29 @@ impl ImageFile {
             )
             .context("prepare fresh upper after restack")?;
 
-            let new_upper_data: Arc<dyn VirtualFile> = Arc::new(
-                LocalFile::open_rw(&upper_data_path, false).with_context(|| {
-                    format!("open fresh upper data {}", upper_data_path.display())
-                })?,
-            );
+            if let Some(codec) = compression {
+                crate::zfile::writable::WritableZFile::initialize(
+                    &upper_data_path,
+                    upper_index_path
+                        .as_deref()
+                        .context("compressed upper index")?,
+                    codec,
+                )?;
+            }
+            let new_upper_data: Arc<dyn VirtualFile> = if compression.is_some() {
+                Arc::new(crate::zfile::writable::WritableZFile::open(
+                    &upper_data_path,
+                    upper_index_path
+                        .as_deref()
+                        .context("compressed upper index")?,
+                )?)
+            } else {
+                Arc::new(
+                    LocalFile::open_rw(&upper_data_path, false).with_context(|| {
+                        format!("open fresh upper data {}", upper_data_path.display())
+                    })?,
+                )
+            };
             let new_upper_index = match upper_mode {
                 UpperMode::Sparse => None,
                 UpperMode::LogStructured | UpperMode::HybridLogStructured => {
@@ -382,6 +515,139 @@ impl ImageFile {
         state.base = ImageFileBase::ReadWrite(restacked);
         self.update_size_metadata(virtual_size);
         Ok(descriptor)
+    }
+
+    async fn restack_vdo(
+        &self,
+        state: &mut LiveImageState,
+        output: &Path,
+    ) -> Result<Option<LayerDescriptor>> {
+        use crate::backend::vdo::{backing_path, VdoFile};
+        use std::os::unix::fs::OpenOptionsExt;
+        let data = PathBuf::from(&state.config.upper.data);
+        let index = PathBuf::from(&state.config.upper.index);
+        let parent = data.parent().context("upper directory")?.to_path_buf();
+        let stage = parent.join(format!(".vdo-restack-{}", Uuid::new_v4()));
+        std::fs::create_dir(&stage)?;
+        let fresh_data = stage.join("upper.data");
+        let fresh_index = stage.join("upper.index");
+        let current = state.base.writable().context("writable VDO upper")?;
+        current.sync().await?;
+        // Export reads through VDO but publishes ordinary LSMT bytes.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(output)?;
+        let exported: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(output, false)?);
+        current
+            .export_upper_as_sealed(CommitArgs::new(exported.clone()))
+            .await?;
+        exported.sync().await?;
+        std::fs::File::open(output)?.sync_all()?;
+        let mut lower_files = current.lower_layer_files_bottom_to_top();
+        lower_files.push(Arc::new(LocalFile::open_ro(output)?) as Arc<dyn VirtualFile>);
+        prepare_runtime_upper(
+            &fresh_data,
+            Some(&fresh_index),
+            self.size_bytes(),
+            UpperMode::HybridLogStructured,
+        )?;
+        VdoFile::initialize_async(&fresh_data, self.size_bytes()).await?;
+        let fresh: Arc<dyn VirtualFile> = Arc::new(VdoFile::open_async(&fresh_data).await?);
+        let fresh_idx: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&fresh_index, false)?);
+        let new_upper = open_file_rw(fresh, Some(fresh_idx)).await?;
+        new_upper.set_max_io_size(current.get_max_io_size())?;
+        new_upper.set_index_group_commit(current.get_index_group_commit_size())?;
+        let lower = open_files_ro_with_premerged_cache(
+            &lower_files,
+            &state.premerged_index_cache_dir,
+            state.premerged_index_cache_policy,
+        )
+        .await?;
+        let restacked = stack_files(&new_upper, &lower, false).await?;
+        // Retain recoverable links until all replacements succeed. The outer
+        // runtime's durable 'started' receipt quarantines any interrupted swap.
+        for (old, name) in [
+            (&data, "previous.data"),
+            (&index, "previous.index"),
+            (&backing_path(&data), "previous.vdo"),
+        ] {
+            std::fs::hard_link(old, stage.join(name))?;
+        }
+        std::fs::File::open(&stage)?.sync_all()?;
+        for (from, to) in [
+            (backing_path(&fresh_data), backing_path(&data)),
+            (fresh_index, index),
+            (fresh_data, data),
+        ] {
+            std::fs::rename(from, to)?;
+        }
+        std::fs::File::open(&parent)?.sync_all()?;
+        state.base = ImageFileBase::ReadWrite(restacked);
+        state.config.lowers.push(LayerConfig {
+            file: output.display().to_string(),
+            ..LayerConfig::default()
+        });
+        std::fs::remove_dir_all(stage)?;
+        Ok(None)
+    }
+
+    async fn export_packed_path(
+        current: &PackedUpper,
+        output: &Path,
+    ) -> Result<Arc<dyn VirtualFile>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let parent = output.parent().context("snapshot parent directory")?;
+        std::fs::create_dir_all(parent)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(output)?;
+        let exported: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(output, false)?);
+        let mut args = CommitArgs::new(exported.clone());
+        args.uuid = Some(current.uuid());
+        current.export_upper_as_sealed(args).await?;
+        exported.sync().await?;
+        // Snapshot bytes must be durable before publishing an upper that depends on them.
+        let disk = crate::packed::FileDisk::open(output, false)?;
+        crate::packed::Disk::barrier(&disk)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(exported)
+    }
+    async fn restack_packed(
+        &self,
+        state: &mut LiveImageState,
+        output: &Path,
+    ) -> Result<Option<LayerDescriptor>> {
+        let ImageFileBase::Packed(current) = &state.base else {
+            unreachable!()
+        };
+        let data = PathBuf::from(&state.config.upper.data);
+        let parent = data.parent().context("packed upper parent")?;
+        let stage = parent.join(format!(".packed-restack-{}", Uuid::new_v4()));
+        std::fs::create_dir(&stage)?;
+        let exported = Self::export_packed_path(current, output).await?;
+        let mut lowers = current.lower_files_bottom_to_top();
+        lowers.push(exported);
+        let lower = crate::lsmt::file::open_files_ro(&lowers).await?;
+        let fresh = stage.join("upper.packed");
+        PackedUpper::create(&fresh, self.size_bytes(), current.policy())?;
+        let restacked = PackedUpper::open(&fresh, Some(Arc::new(lower)), current.policy()).await?;
+        std::fs::hard_link(&data, stage.join("previous.packed"))?;
+        std::fs::File::open(&stage)?.sync_all()?;
+        std::fs::File::open(parent)?.sync_all()?;
+        std::fs::rename(&fresh, &data)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        state.base = ImageFileBase::Packed(restacked);
+        state.config.lowers.push(LayerConfig {
+            file: output.display().to_string(),
+            ..LayerConfig::default()
+        });
+        std::fs::remove_dir_all(&stage)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(None)
     }
 
     async fn init_image_file(
@@ -606,7 +872,25 @@ impl ImageFile {
             ));
         }
 
-        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&upper.data, false)?);
+        let data_file: Arc<dyn VirtualFile> =
+            if crate::backend::vdo::capacity(Path::new(&upper.data))?.is_some() {
+                anyhow::ensure!(
+                    upper.writable_mode() == UpperMode::HybridLogStructured,
+                    "VDO upper requires hybrid mode"
+                );
+                Arc::new(crate::backend::vdo::VdoFile::open_async(Path::new(&upper.data)).await?)
+            } else if crate::zfile::writable::codec(Path::new(&upper.data))?.is_some() {
+                anyhow::ensure!(
+                    upper.writable_mode() == UpperMode::LogStructured,
+                    "compressed upper requires logStructured mode"
+                );
+                Arc::new(crate::zfile::writable::WritableZFile::open(
+                    Path::new(&upper.data),
+                    Path::new(&upper.index),
+                )?)
+            } else {
+                Arc::new(LocalFile::open_rw(&upper.data, false)?)
+            };
         let idx_file = match upper.writable_mode() {
             UpperMode::Sparse => None,
             UpperMode::LogStructured | UpperMode::HybridLogStructured => {
@@ -616,6 +900,16 @@ impl ImageFile {
                 Some(Arc::new(LocalFile::open_rw(&upper.index, false)?) as Arc<dyn VirtualFile>)
             }
         };
+        if data_file
+            .as_any()
+            .is_some_and(|f| f.is::<crate::backend::vdo::VdoFile>())
+        {
+            crate::lsmt::file::validate_virtual_hybrid_pair(
+                &data_file,
+                idx_file.as_ref().context("VDO index missing")?,
+            )
+            .await?;
+        }
         Ok(Some(open_file_rw(data_file, idx_file).await?))
     }
 
@@ -683,6 +977,7 @@ impl ImageFile {
         match base {
             ImageFileBase::ReadOnly(file) => file.size().await,
             ImageFileBase::ReadWrite(file) => file.size().await,
+            ImageFileBase::Packed(file) => file.size().await,
         }
     }
 
@@ -795,6 +1090,7 @@ impl VirtualFile for ImageFile {
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.read_at(offset, len).await,
             ImageFileBase::ReadWrite(file) => file.read_at(offset, len).await,
+            ImageFileBase::Packed(file) => file.read_at(offset, len).await,
         }
     }
 
@@ -804,6 +1100,7 @@ impl VirtualFile for ImageFile {
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.read_at_into(offset, dst).await,
             ImageFileBase::ReadWrite(file) => file.read_at_into(offset, dst).await,
+            ImageFileBase::Packed(file) => file.read_at_into(offset, dst).await,
         }
     }
 
@@ -811,10 +1108,11 @@ impl VirtualFile for ImageFile {
         let state = self.state.read().await;
         let written = state
             .base
-            .writable()
+            .writable_file()
             .context("writing read-only image file")?
             .write_at(offset, data)
             .await?;
+        drop(state);
         self.refresh_size_metadata().await?;
         Ok(written)
     }
@@ -835,6 +1133,7 @@ impl VirtualFile for ImageFile {
             match &state.base {
                 ImageFileBase::ReadOnly(file) => file.read_at_with_ctx(ctx, offset, len).await,
                 ImageFileBase::ReadWrite(file) => file.read_at_with_ctx(ctx, offset, len).await,
+                ImageFileBase::Packed(file) => file.read_at_with_ctx(ctx, offset, len).await,
             }
         })
     }
@@ -856,6 +1155,7 @@ impl VirtualFile for ImageFile {
                 ImageFileBase::ReadWrite(file) => {
                     file.read_at_into_with_ctx(ctx, offset, dst).await
                 }
+                ImageFileBase::Packed(file) => file.read_at_into(offset, dst).await,
             }
         })
     }
@@ -871,10 +1171,11 @@ impl VirtualFile for ImageFile {
             let state = self.state.read().await;
             let written = state
                 .base
-                .writable()
+                .writable_file()
                 .context("writing read-only image file")?
                 .write_at_with_ctx(ctx, offset, data)
                 .await?;
+            drop(state);
             self.refresh_size_metadata().await?;
             Ok(written)
         })
@@ -891,10 +1192,11 @@ impl VirtualFile for ImageFile {
             let state = self.state.read().await;
             let written = state
                 .base
-                .writable()
+                .writable_file()
                 .context("writing read-only image file")?
                 .write_bytes_at_with_ctx(ctx, offset, data)
                 .await?;
+            drop(state);
             self.refresh_size_metadata().await?;
             Ok(written)
         })
@@ -904,10 +1206,11 @@ impl VirtualFile for ImageFile {
         let state = self.state.read().await;
         state
             .base
-            .writable()
+            .writable_file()
             .context("discarding read-only image file")?
             .discard(offset, len)
             .await?;
+        drop(state);
         self.refresh_size_metadata().await?;
         Ok(())
     }
@@ -920,10 +1223,11 @@ impl VirtualFile for ImageFile {
         let state = self.state.read().await;
         state
             .base
-            .writable()
+            .writable_file()
             .context("truncating read-only image file")?
             .truncate(size)
             .await?;
+        drop(state);
         self.refresh_size_metadata().await?;
         Ok(())
     }
@@ -933,6 +1237,7 @@ impl VirtualFile for ImageFile {
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.sync().await,
             ImageFileBase::ReadWrite(file) => file.sync().await,
+            ImageFileBase::Packed(file) => file.sync().await,
         }
     }
 
@@ -945,6 +1250,7 @@ impl VirtualFile for ImageFile {
             ImageFileBase::ReadWrite(file) => {
                 <LSMTFile as VirtualFile>::seek_data(file, offset).await
             }
+            ImageFileBase::Packed(file) => file.seek_data(offset).await,
         }
     }
 
@@ -957,6 +1263,7 @@ impl VirtualFile for ImageFile {
             ImageFileBase::ReadWrite(file) => {
                 <LSMTFile as VirtualFile>::seek_hole(file, offset).await
             }
+            ImageFileBase::Packed(file) => file.seek_hole(offset).await,
         }
     }
 
@@ -965,6 +1272,7 @@ impl VirtualFile for ImageFile {
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.evict_range(offset, len).await,
             ImageFileBase::ReadWrite(file) => file.evict_range(offset, len).await,
+            ImageFileBase::Packed(file) => file.evict_range(offset, len).await,
         }
     }
 
@@ -973,6 +1281,7 @@ impl VirtualFile for ImageFile {
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.evict_all().await,
             ImageFileBase::ReadWrite(file) => file.evict_all().await,
+            ImageFileBase::Packed(file) => file.evict_all().await,
         }
     }
 }
@@ -998,6 +1307,74 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
     use tokio::time::{sleep, Duration};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn packed_snapshot_restack_reopen_and_fork() -> Result<()> {
+        let dir = TempDir::new()?;
+        let service = build_service(&dir).await;
+        let data = dir.path().join("upper.packed");
+        let size = 8192;
+        PackedUpper::create(&data, size, crate::packed::Policy::default())?;
+        let mut config = ImageConfig {
+            upper: UpperConfig {
+                data: data.display().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let image = ImageFile::open_packed(
+            config.clone(),
+            service.clone(),
+            crate::packed::Policy::default(),
+        )
+        .await?;
+        image.write_at(0, &[7; 8192]).await?;
+        image.sync().await?;
+        let snapshot = dir.path().join("snapshot.sealed");
+        image.create_snapshot_and_restack(&snapshot).await?;
+        image.write_at(13, &[9; 7000]).await?;
+        image.discard(500, 512).await?;
+        image.sync().await?;
+        let mut expected = vec![7; 8192];
+        expected[13..7013].fill(9);
+        expected[500..1012].fill(0);
+        assert_eq!(image.read_at(0, 8192).await?.as_ref(), expected);
+        drop(image);
+        config.lowers.push(LayerConfig {
+            file: snapshot.display().to_string(),
+            ..Default::default()
+        });
+        let reopened = ImageFile::open_packed(
+            config.clone(),
+            service.clone(),
+            crate::packed::Policy {
+                compression: crate::packed::Codec::None,
+                dedupe: false,
+            },
+        )
+        .await?;
+        assert_eq!(reopened.read_at(0, 8192).await?.as_ref(), expected);
+        let flat = Arc::new(LocalFile::new(dir.path().join("flat.sealed"))?);
+        reopened.compact(flat.clone()).await?;
+        assert_eq!(
+            LSMTReadOnlyFile::open(flat)
+                .await?
+                .read_at(0, 8192)
+                .await?
+                .as_ref(),
+            expected
+        );
+        let fork = dir.path().join("fork.packed");
+        PackedUpper::create(&fork, size, crate::packed::Policy::default())?;
+        config.upper.data = fork.display().to_string();
+        let child =
+            ImageFile::open_packed(config, service, crate::packed::Policy::default()).await?;
+        assert_eq!(child.read_at(0, 8192).await?.as_ref(), &[7; 8192]);
+        child.write_at(0, &[4; 512]).await?;
+        child.sync().await?;
+        assert_eq!(reopened.read_at(0, 8192).await?.as_ref(), expected);
+        Ok(())
+    }
 
     async fn create_sealed_lower(path: &Path, index_path: &Path, payload: &[u8]) -> Result<()> {
         let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path)?);

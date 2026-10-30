@@ -10,3 +10,5 @@ pub mod tar;
 // Backward-compatible path while implementation is aligned to overlaybd registryfs_v2.
 #[cfg(feature = "full")]
 pub use registryfs_v2 as remote;
+
+pub mod vdo;

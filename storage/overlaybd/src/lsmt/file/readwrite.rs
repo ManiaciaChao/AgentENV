@@ -60,6 +60,18 @@ pub struct LSMTFile {
 }
 
 impl LSMTFile {
+    pub fn compression_write_profile(&self) -> Option<crate::zfile::writable::WriteProfile> {
+        self.rw_data_file
+            .as_any()?
+            .downcast_ref::<crate::zfile::writable::WritableZFile>()
+            .map(|f| f.write_profile())
+    }
+    pub async fn vdo_space_usage(&self) -> Result<Option<crate::backend::vdo::SpaceUsage>> {
+        match self.rw_data_file.as_any().and_then(|f| f.downcast_ref::<crate::backend::vdo::VdoFile>()) {
+            Some(file) => Ok(Some(file.space_usage().await?)),
+            None => Ok(None),
+        }
+    }
     pub fn index(&self) -> Arc<RwLock<ComboIndex>> {
         self.index.clone()
     }
@@ -267,6 +279,12 @@ impl LSMTFile {
         file_type: LSMTFileType,
         data_file_size: u64,
     ) -> Result<Option<AppendDigestTracker>> {
+        if rw_data_file
+            .as_any()
+            .is_some_and(|f| f.is::<crate::zfile::writable::WritableZFile>())
+        {
+            return Ok(None);
+        }
         if file_type != LSMTFileType::ReadWrite {
             return Ok(None);
         }
@@ -533,6 +551,10 @@ impl LSMTFile {
 
     async fn flush_group_commit(&self) -> Result<()> {
         let idx = self.index.write().await;
+        self.flush_group_commit_locked(&idx).await
+    }
+
+    async fn flush_group_commit_locked(&self, idx: &RwLockWriteGuard<'_, ComboIndex>) -> Result<()> {
         let mut buf = self.group_commit_buf.lock().await;
         if buf.is_empty() {
             return Ok(());
@@ -541,7 +563,7 @@ impl LSMTFile {
         for m in buf.iter() {
             bytes.extend_from_slice(m.as_bytes());
         }
-        self.append_index_bytes(&idx, &DirectWrite, &bytes).await?;
+        self.append_index_bytes(idx, &DirectWrite, &bytes).await?;
         buf.clear();
         Ok(())
     }
@@ -692,6 +714,11 @@ impl LSMTFile {
                 self.rw_tag as u8,
             ));
         }
+        let vdo = self.rw_data_file.as_any()
+            .is_some_and(|f| f.is::<crate::backend::vdo::VdoFile>());
+        let physical: Vec<_> = if vdo { zeros.iter().filter(|m| m.has_physical_range())
+            .map(|m| (m.moffset * ALIGNMENT, m.length() as u64 * ALIGNMENT)).collect() }
+            else { Vec::new() };
         for mapping in zeros {
             let mut disk_mapping = mapping;
             disk_mapping.tag = 0;
@@ -702,6 +729,16 @@ impl LSMTFile {
             )
             .await?;
             idx.insert(mapping);
+        }
+        if vdo && !physical.is_empty() {
+            // Publish durable zero masks BEFORE removing physical contents.
+            // Interrupted reclamation may leak space, but must not expose a
+            // lower layer or revive a reference to punched data after recovery.
+            self.flush_group_commit_locked(&idx).await?;
+            if let Some(file) = &self.rw_index_file { file.sync().await?; }
+            for (offset, length) in physical {
+                self.rw_data_file.discard(offset, length).await?;
+            }
         }
         Ok(())
     }
@@ -789,8 +826,15 @@ impl LSMTFile {
         while !remaining_data.is_empty() {
             let chunk_len = std::cmp::min(remaining_data.len(), max_io_size);
             let chunk = &remaining_data[..chunk_len];
+            let compressed = self.rw_data_file.as_any().and_then(|f| {
+                f.downcast_ref::<crate::zfile::writable::WritableZFile>()
+            });
+            // Encoding has no visible side effects. Reserve the append offset
+            // and publish mappings only after acquiring the index lock.
+            let prepared = compressed.map(|f| f.prepare_append(chunk)).transpose()?;
 
             let mut idx = self.index.write().await;
+            ensure!(!self.sealed.load(Ordering::Acquire), "File is sealed.");
 
             if self.file_type == LSMTFileType::HybridReadWrite {
                 // Hybrid keeps the index write lock through physical I/O by design.
@@ -913,10 +957,14 @@ impl LSMTFile {
                 )
             } else {
                 let phys_offset = self.data_append_offset()?;
-                writer
-                    .write(self.rw_data_file.as_ref(), phys_offset, chunk)
-                    .await?;
-                self.advance_data_append_offset(phys_offset, chunk_len)?;
+                let stored_len = if let (Some(file), Some(prepared)) = (compressed, prepared) {
+                    file.append_prepared(phys_offset, prepared)?;
+                    chunk_len.div_ceil(4096) * 4096
+                } else {
+                    writer.write(self.rw_data_file.as_ref(), phys_offset, chunk).await?;
+                    chunk_len
+                };
+                self.advance_data_append_offset(phys_offset, stored_len)?;
                 let mut tracker = self.append_digest.lock().await;
                 if let Some(state) = tracker.as_mut() {
                     if state.absorb(phys_offset, chunk).is_err() {
@@ -1027,7 +1075,7 @@ impl LSMTFile {
         let mut tracker = self.append_digest.lock().await;
         Self::absorb_seal_bytes(&mut tracker, index_offset, &index_bytes);
 
-        let mut trailer_offset = index_offset + index_bytes.len() as u64;
+        let mut trailer_offset = self.rw_data_file.size().await?;
         if !trailer_offset.is_multiple_of(4096) {
             let pad_len = 4096 - (trailer_offset % 4096);
             let pad = vec![0u8; pad_len as usize];
@@ -1061,6 +1109,14 @@ impl LSMTFile {
             .await?;
         Self::absorb_seal_bytes(&mut tracker, trailer_offset, &trailer_buf);
 
+        if let Some(z) = self
+            .rw_data_file
+            .as_any()
+            .and_then(|f| f.downcast_ref::<crate::zfile::writable::WritableZFile>())
+        {
+            z.finish()?;
+            return Ok(None); // Logical-stream digest is not the compressed artifact digest.
+        }
         Ok(tracker.as_ref().map(AppendDigestTracker::descriptor))
     }
 
@@ -1313,10 +1369,27 @@ impl VirtualFile for LSMTFile {
     }
 
     async fn sync(&self) -> Result<()> {
-        self.flush_group_commit().await?;
+        // Freeze mapping appends while the compressed backend commits its
+        // data boundary and the corresponding index-file boundary together.
+        let _compressed_guard = if self
+            .rw_data_file
+            .as_any()
+            .is_some_and(|f| f.is::<crate::zfile::writable::WritableZFile>())
+        {
+            Some(self.index.write().await)
+        } else {
+            None
+        };
+        if let Some(ref idx) = _compressed_guard {
+            self.flush_group_commit_locked(idx).await?;
+        } else {
+            self.flush_group_commit().await?;
+        }
         self.rw_data_file.sync().await?;
-        if let Some(ref idx_file) = self.rw_index_file {
-            idx_file.sync().await?;
+        if _compressed_guard.is_none() {
+            if let Some(ref idx_file) = self.rw_index_file {
+                idx_file.sync().await?;
+            }
         }
         Ok(())
     }

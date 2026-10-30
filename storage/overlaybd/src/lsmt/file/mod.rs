@@ -20,3 +20,5 @@ pub(crate) use types::{ReadOnlyLayerMetadata, PARALLEL_LOAD_INDEX, PREMERGED_IND
 
 #[cfg(test)]
 mod tests;
+
+pub use helper::validate_virtual_hybrid_pair;

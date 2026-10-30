@@ -1682,3 +1682,19 @@ mod tests {
         assert_eq!(segment, SegmentMapping::new(2, 0, 9, false, 0));
     }
 }
+
+/// Validate the same ownership boundary when the data file is virtual (VDO).
+pub async fn validate_virtual_hybrid_pair(data: &Arc<dyn VirtualFile>, index: &Arc<dyn VirtualFile>) -> Result<()> {
+    let data_size = data.size().await?;
+    let index_size = index.size().await?;
+    ensure!(data_size >= HEADER_SIZE && index_size >= HEADER_SIZE, "truncated upper pair");
+    let d = verify_ht(data, false, data_size).await?;
+    let i = verify_ht(index, false, index_size).await?;
+    ensure!(!d.is_sealed() && !i.is_sealed(), "sealed upper pair");
+    ensure!(d.is_data_file() && !i.is_data_file(), "invalid data/index header types");
+    ensure!(d.is_hybrid_rw() && i.is_hybrid_rw() && !d.is_sparse_rw() && !i.is_sparse_rw(), "VDO requires hybrid headers");
+    ensure!(d.uuid == i.uuid && d.virtual_size == i.virtual_size, "VDO upper data/index identity mismatch");
+    ensure!(i.index_offset.get() == HEADER_SIZE, "invalid upper index offset");
+    ensure!((index_size - HEADER_SIZE).is_multiple_of(size_of::<DiskSegmentMapping>() as u64), "misaligned upper index");
+    Ok(())
+}

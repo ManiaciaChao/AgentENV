@@ -3240,3 +3240,6 @@ mod tests {
         }
     );
 }
+
+/// Live append-only compressed upper support.
+pub mod writable;

@@ -174,11 +174,16 @@ impl LSMTReadOnlyFile {
     }
 
     pub async fn flatten(&self, dest_file: Arc<dyn VirtualFile>) -> Result<()> {
+        let writer: Arc<dyn CompactWriter> = Arc::new(VirtualFileWriter::new(dest_file));
+        self.flatten_with_args(CommitArgs::from_writer(writer))
+            .await
+    }
+
+    /// Flatten directly into a streaming writer, including standard ZFile.
+    pub async fn flatten_with_args(&self, commit_args: CommitArgs) -> Result<()> {
         let query = Segment::new(0, (self.virtual_size.div_ceil(ALIGNMENT)) as u32);
         let mut mappings = Vec::new();
         self.index.lookup(query, &mut mappings);
-        let writer: Arc<dyn CompactWriter> = Arc::new(VirtualFileWriter::new(dest_file));
-        let commit_args = CommitArgs::from_writer(writer);
         compact_to(&self.layers, &mappings, self.virtual_size, commit_args).await
     }
 
