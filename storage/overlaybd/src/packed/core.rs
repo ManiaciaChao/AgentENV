@@ -64,6 +64,8 @@ pub struct Stats {
     pub publication_ns: u64,
     pub cleaner_ns: u64,
     pub cleaner_pending_bytes: u64,
+    pub cleaner_punch_batches: u64,
+    pub cleaner_selection_ns: u64,
     pub metadata_cache_hits: u64,
     pub metadata_cache_misses: u64,
     pub bookkeeping_ns: u64,
@@ -95,6 +97,9 @@ struct Root {
     objects: Map<Value>,
     pages: PageSet,
     data_counts: Map<u32>,
+    // Derived COW index: aligned live bytes and occupied pages per segment.
+    // Rebuilt on open; it is not a second durable allocation ledger.
+    segments: Map<(u64, u64)>,
     encoded_bytes: u64,
     aligned_bytes: u64,
 }
@@ -137,6 +142,7 @@ impl Root {
             objects: Map::new(),
             pages: PageSet::new(),
             data_counts: Map::new(),
+            segments: Map::new(),
             encoded_bytes: 0,
             aligned_bytes: 0,
         };
@@ -188,8 +194,13 @@ impl Root {
             );
         }
         for v in objects.values() {
+            r.segments.get_or_default(v[0] / SEGMENT).0 += v[1].next_multiple_of(64);
             for page in object_pages(v) {
-                *r.data_counts.get_or_default(page) += 1;
+                let count = r.data_counts.get_or_default(page);
+                if *count == 0 {
+                    r.segments.get_or_default(v[0] / SEGMENT).1 += 1;
+                }
+                *count += 1;
             }
         }
         r.pages.extend(r.data_counts.keys().copied());
@@ -602,6 +613,7 @@ impl Core {
             objects: Map::new(),
             pages: PageSet::new(),
             data_counts: Map::new(),
+            segments: Map::new(),
             encoded_bytes: 0,
             aligned_bytes: 0,
         };
@@ -1190,6 +1202,9 @@ impl Core {
                 continue;
             }
             if let Some(v) = old {
+                let seg = next.segments.get_mut(&(v[0] / SEGMENT))
+                    .context("missing packed segment")?;
+                seg.0 -= v[1].next_multiple_of(64);
                 for p in object_pages(v) {
                     let count = next
                         .data_counts
@@ -1197,14 +1212,25 @@ impl Core {
                         .context("missing data-page reference")?;
                     *count -= 1;
                     if *count == 0 {
+                        seg.1 -= 1;
                         next.data_counts.remove(&p);
                         next.pages.remove(&p);
                     }
                 }
+                if seg.1 == 0 {
+                    debug_assert_eq!(seg.0, 0);
+                    next.segments.remove(&(v[0] / SEGMENT));
+                }
             }
             if let Some(v) = new {
+                let seg = next.segments.get_or_default(v[0] / SEGMENT);
+                seg.0 += v[1].next_multiple_of(64);
                 for p in object_pages(v) {
-                    *next.data_counts.get_or_default(p) += 1;
+                    let count = next.data_counts.get_or_default(p);
+                    if *count == 0 {
+                        seg.1 += 1;
+                    }
+                    *count += 1;
                     next.pages.insert(p);
                 }
             }
@@ -1410,17 +1436,14 @@ impl Core {
         if fragmented >= 8 * 1024 * 1024
             || (data_bytes > SEGMENT && fragmented * 10 >= data_bytes * 3)
         {
-            let mut segments: BTreeMap<u64, (u64, BTreeSet<u64>)> = BTreeMap::new();
-            for v in self.root().objects.values() {
-                let s = segments.entry(v[0] / SEGMENT).or_default();
-                s.0 += v[1].next_multiple_of(64);
-                s.1.extend(object_pages(v));
-            }
-            if let Some((&seg, _)) = segments
+            let selection_started = Instant::now();
+            let victim = self.root().segments
                 .iter()
-                .filter(|(_, v)| v.0 * 10 < (v.1.len() as u64 * PAGE as u64) * 7)
+                .filter(|(_, v)| v.0 * 10 < v.1 * PAGE as u64 * 7)
                 .min_by_key(|(_, v)| v.0)
-            {
+                .map(|(&seg, _)| seg);
+            self.stats.cleaner_selection_ns += selection_started.elapsed().as_nanos() as u64;
+            if let Some(seg) = victim {
                 if should_yield() {
                     return Ok(());
                 }
@@ -1445,8 +1468,19 @@ impl Core {
             .filter(|p| !self.punched.contains(p))
             .take(if wake.is_some() { 4096 } else { usize::MAX })
             .collect();
+        // Pinned retirement and fragmentation are not punchable space. They
+        // must not turn each tiny metadata hole into its own fullsync job.
+        // Below the threshold, holes remain immediately reusable by writers.
+        let punch_bytes = free.len() as u64 * PAGE as u64;
+        if punch_bytes < 8 * 1024 * 1024
+            && punch_bytes.saturating_mul(10) < allocated.max(PAGE as u64).saturating_mul(3)
+        {
+            self.warm_dedupe(32)?;
+            return Ok(());
+        }
         if let Some(wake) = wake {
             if !free.is_empty() {
+                self.stats.cleaner_punch_batches += 1;
                 if self.cleaner.is_none() {
                     self.cleaner = Some(super::cleaner::Cleaner::new()?);
                 }
@@ -1514,6 +1548,7 @@ impl Core {
             i += n;
         }
         if i > 0 {
+            self.stats.cleaner_punch_batches += 1;
             self.barrier()?;
         }
         self.warm_dedupe(32)?;
@@ -1555,6 +1590,103 @@ impl Core {
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
+
+    fn check_segments(root: &Root) {
+        let mut expected: BTreeMap<u64, (u64, BTreeSet<u64>)> = BTreeMap::new();
+        for (_, v) in root.objects.iter() {
+            let entry = expected.entry(v[0] / SEGMENT).or_default();
+            entry.0 += v[1].next_multiple_of(64);
+            entry.1.extend(object_pages(v));
+        }
+        let expected: BTreeMap<_, _> = expected.into_iter()
+            .map(|(seg, (bytes, pages))| (seg, (bytes, pages.len() as u64))).collect();
+        let actual: BTreeMap<_, _> = root.segments.iter().map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn segment_occupancy_tracks_shared_objects_relocation_and_reopen() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let disk = Arc::new(super::super::disk::FileDisk::open(&dir.path().join("pack"), true)?);
+        let mut core = Core::create(disk.clone(), 2048 * PAGE as u64, Policy::default())?;
+        let mut rng = 17u64;
+        for policy in [
+            Policy { compression: Codec::None, dedupe: false },
+            Policy { compression: Codec::Lz4, dedupe: true },
+            Policy { compression: Codec::Zstd, dedupe: false },
+        ] {
+            core.set_policy(policy)?;
+            for lba in 0..2048 {
+                let mut block = Box::new([0; PAGE]);
+                if lba % 4 != 0 {
+                    for byte in &mut block[..2048] {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        *byte = rng as u8;
+                    }
+                } else {
+                    block.fill(37);
+                }
+                core.stage(lba, block)?;
+            }
+            core.commit()?;
+            check_segments(core.root());
+            let pinned = core.view();
+            for lba in (0..2048).step_by(3) {
+                core.stage(lba, Box::new([0; PAGE]))?;
+            }
+            core.commit()?;
+            check_segments(core.root());
+            let victim = *core.root().segments.iter().next().unwrap().0;
+            core.publish(true, Some(victim))?;
+            check_segments(core.root());
+            assert_eq!(pinned.read(0)?.unwrap().as_slice(), &[37; PAGE]);
+            drop(pinned);
+            drop(core);
+            core = Core::open(disk.clone(), policy)?;
+            check_segments(core.root());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_retirement_does_not_trigger_tiny_punch_barriers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let disk = Arc::new(super::super::disk::FileDisk::open(&dir.path().join("pack"), true)?);
+        let mut core = Core::create(disk, 4096 * PAGE as u64,
+            Policy { compression: Codec::None, dedupe: false })?;
+        for lba in 0..4096 {
+            core.stage(lba, Box::new([19; PAGE]))?;
+        }
+        core.commit()?;
+        let pinned = core.view();
+        for lba in 0..4096 {
+            core.stage(lba, Box::new([0; PAGE]))?;
+        }
+        core.commit()?;
+        // Retire a small subsequent allocation while the large old data set
+        // remains pinned, then rotate away its last recoverable reference.
+        core.stage(0, Box::new([21; PAGE]))?;
+        core.commit()?;
+        core.stage(0, Box::new([0; PAGE]))?;
+        core.commit()?;
+        core.publish(true, None)?;
+        let before = core.stats()?;
+        assert!(before.retired_bytes >= 8 * 1024 * 1024);
+        assert!(before.reclaimable_bytes > 0 && before.reclaimable_bytes < 8 * 1024 * 1024);
+        for _ in 0..8 {
+            core.maintenance()?;
+        }
+        assert_eq!(core.stats()?.barriers, before.barriers);
+        assert_eq!(core.stats()?.cleaner_punch_batches, 0);
+        assert_eq!(pinned.read(0)?.unwrap().as_slice(), &[19; PAGE]);
+        drop(pinned);
+        core.maintenance()?;
+        assert!(core.stats()?.reclaimed_bytes >= 8 * 1024 * 1024);
+        assert_eq!(core.read_block(0)?.unwrap().as_slice(), &[0; PAGE]);
+        Ok(())
+    }
 
     #[test]
     fn packed_payloads_cross_pages_and_output_batches_without_rewriting_closed_pages() -> Result<()>
