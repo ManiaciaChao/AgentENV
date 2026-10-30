@@ -1,7 +1,7 @@
 //! Logical-block adapter. This experimental API is deliberately not selected by
 //! existing upper creation paths until lifecycle and performance acceptance pass.
 use super::{
-    core::{Core, ReadView, DIRTY_LIMIT, READ_BLOCKS},
+    core::{Core, ReadMask, ReadView, DIRTY_LIMIT, READ_BLOCKS},
     disk::{FileDisk, PAGE},
     Policy, Stats,
 };
@@ -539,22 +539,22 @@ impl PackedUpper {
                 .collect();
             (pending, f.view.clone())
         };
-        let mut skip = 0;
+        let mut skip = ReadMask::default();
         for (i, block) in pending.iter().enumerate() {
             if let Some(block) = block {
                 dst[i * PAGE..(i + 1) * PAGE].copy_from_slice(block.as_ref());
-                skip |= 1 << i;
+                skip.insert(i);
             }
         }
         let covered = view.read_blocks(lba, skip, dst)?;
         let mut i = 0;
         while i < count {
-            if covered & (1 << i) != 0 {
+            if covered.contains(i) {
                 i += 1;
                 continue;
             }
             let first = i;
-            while i < count && covered & (1 << i) == 0 {
+            while i < count && !covered.contains(i) {
                 i += 1;
             }
             let bytes = &mut dst[first * PAGE..i * PAGE];

@@ -13,7 +13,17 @@ use std::{
 };
 pub const SEGMENT: u64 = 2 * 1024 * 1024;
 pub const DIRTY_LIMIT: usize = 16 * 1024 * 1024;
-pub(super) const READ_BLOCKS: usize = 32;
+pub(super) const READ_BLOCKS: usize = 256;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ReadMask(pub [u64; READ_BLOCKS / 64]);
+impl ReadMask {
+    pub fn contains(self, index: usize) -> bool {
+        self.0[index / 64] & (1 << (index % 64)) != 0
+    }
+    pub fn insert(&mut self, index: usize) {
+        self.0[index / 64] |= 1 << (index % 64);
+    }
+}
 const MAGIC: &[u8; 8] = b"OBDPACK1";
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -563,7 +573,7 @@ impl ReadView {
     /// Read one immutable mapping version, sorting physical objects so a
     /// contiguous logical request does not become one host pread per 4 KiB.
     /// Bits in skip belong to newer frontend buffers; unset return bits use lower.
-    pub(super) fn read_blocks(&self, lba: u64, skip: u32, dst: &mut [u8]) -> Result<u32> {
+    pub(super) fn read_blocks(&self, lba: u64, skip: ReadMask, dst: &mut [u8]) -> Result<ReadMask> {
         self.check()?;
         ensure!(
             dst.len().is_multiple_of(PAGE) && dst.len() / PAGE <= READ_BLOCKS,
@@ -571,32 +581,30 @@ impl ReadView {
         );
         let result = (|| {
             let mut covered = skip;
-            let mut entries = [(0usize, [0u64; 6]); READ_BLOCKS];
-            let mut count = 0;
+            let mut entries = Vec::with_capacity(dst.len() / PAGE);
             for i in 0..dst.len() / PAGE {
-                if skip & (1 << i) != 0 {
+                if skip.contains(i) {
                     continue;
                 }
                 let Some(&id) = self.root.map.get(&(lba + i as u64)) else {
                     continue;
                 };
-                covered |= 1 << i;
+                covered.insert(i);
                 if id == 0 {
                     dst[i * PAGE..(i + 1) * PAGE].fill(0);
                 } else {
-                    entries[count] = (
+                    entries.push((
                         i,
                         *self
                             .root
                             .objects
                             .get(&id)
                             .context("missing packed object")?,
-                    );
-                    count += 1;
+                    ));
                 }
             }
+            let count = entries.len();
             self.writes.count_read_blocks(count);
-            let entries = &mut entries[..count];
             entries.sort_unstable_by_key(|(_, value)| value[0]);
             let mut stored = Vec::new();
             let mut first = 0;
