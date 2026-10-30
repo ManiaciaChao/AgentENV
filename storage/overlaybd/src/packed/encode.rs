@@ -5,15 +5,11 @@ use super::{
 };
 use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::Arc,
-    thread,
-};
-type Input = Vec<(u64, Arc<[u8; PAGE]>)>;
+use std::{collections::VecDeque, sync::Arc, thread};
+type Input = Vec<(u64, super::buffer::Block)>;
 pub(super) struct Block {
     pub lba: u64,
-    pub plain: Arc<[u8; PAGE]>,
+    pub plain: super::buffer::Block,
     pub offset: usize,
     pub len: usize,
     pub codec: u64,
@@ -26,11 +22,31 @@ pub(super) struct Batch {
     pub blocks: Vec<Block>,
     pub bytes: Vec<u8>,
     pub packed: bool,
+    recycle: Option<crossbeam_channel::Sender<Vec<u8>>>,
 }
-fn prepare(input: Input, policy: Policy) -> Result<Batch> {
+#[derive(Clone)]
+struct Buffers {
+    tx: crossbeam_channel::Sender<Vec<u8>>,
+    rx: crossbeam_channel::Receiver<Vec<u8>>,
+}
+impl Drop for Batch {
+    fn drop(&mut self) {
+        if let Some(recycle) = &self.recycle {
+            let mut bytes = std::mem::take(&mut self.bytes);
+            bytes.clear();
+            if bytes.capacity() <= JOB_BLOCKS * PAGE {
+                let _ = recycle.try_send(bytes);
+            }
+        }
+    }
+}
+fn prepare(input: Input, policy: Policy, buffers: Option<&Buffers>) -> Result<Batch> {
     let mut batch = Batch {
         blocks: Vec::with_capacity(input.len()),
-        bytes: Vec::with_capacity(input.len() * PAGE),
+        bytes: buffers
+            .and_then(|b| b.rx.try_recv().ok())
+            .unwrap_or_else(|| Vec::with_capacity(input.len() * PAGE)),
+        recycle: buffers.map(|b| b.tx.clone()),
         packed: !policy.dedupe,
     };
     let mut scratch = [0u8; PAGE * 2];
@@ -116,10 +132,46 @@ fn prepare(input: Input, policy: Policy) -> Result<Batch> {
 struct Job {
     input: Input,
     policy: Policy,
-    result: crossbeam_channel::Sender<Result<Batch>>,
+    result: std::sync::mpsc::Sender<Result<Batch>>,
+}
+// Sleeping waits release the queue mutex. No receiver owns the queue while
+// waiting, and no worker yields repeatedly when the producer is temporarily idle.
+#[derive(Default)]
+struct Jobs {
+    state: std::sync::Mutex<(VecDeque<Job>, bool)>,
+    ready: std::sync::Condvar,
+    space: std::sync::Condvar,
+}
+impl Jobs {
+    fn send(&self, job: Job) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        while state.0.len() == 4 && !state.1 {
+            state = self.space.wait(state).unwrap();
+        }
+        ensure!(!state.1, "packed encoder exited");
+        state.0.push_back(job);
+        self.ready.notify_one();
+        Ok(())
+    }
+    fn recv(&self) -> Option<Job> {
+        let mut state = self.state.lock().unwrap();
+        while state.0.is_empty() && !state.1 {
+            state = self.ready.wait(state).unwrap();
+        }
+        let job = state.0.pop_front();
+        if job.is_some() {
+            self.space.notify_one();
+        }
+        job
+    }
+    fn close(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.ready.notify_all();
+        self.space.notify_all();
+    }
 }
 struct SharedPool {
-    tx: Option<crossbeam_channel::Sender<Job>>,
+    jobs: Arc<Jobs>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 // Process-lifetime ownership prevents teardown/recreation from briefly spawning
@@ -134,25 +186,27 @@ impl SharedPool {
         let count = thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(4);
-        let (tx, rx) = crossbeam_channel::bounded::<Job>(4);
         let mut pool = Self {
-            tx: Some(tx),
+            jobs: Arc::new(Jobs::default()),
             workers: Vec::new(),
         };
+        let (tx, rx_buffers) = crossbeam_channel::bounded(8);
+        let buffers = Buffers { tx, rx: rx_buffers };
         for i in 0..count {
-            let jobs = rx.clone();
+            let buffers = buffers.clone();
+            let jobs = pool.jobs.clone();
             pool.workers.push(
                 thread::Builder::new()
                     .name(format!("packed-encode-{i}"))
                     .spawn(move || loop {
-                        // Every worker waits directly on the bounded MPMC queue.
-                        // No sleeping receiver holds a mutex needed by its peers.
                         let job = jobs.recv();
                         match job {
-                            Ok(job) => {
-                                let _ = job.result.send(prepare(job.input, job.policy));
+                            Some(job) => {
+                                let _ =
+                                    job.result
+                                        .send(prepare(job.input, job.policy, Some(&buffers)));
                             }
-                            Err(_) => break,
+                            None => break,
                         }
                     })?,
             );
@@ -164,7 +218,7 @@ impl SharedPool {
 }
 impl Drop for SharedPool {
     fn drop(&mut self) {
-        self.tx.take();
+        self.jobs.close();
         for join in self.workers.drain(..) {
             let _ = join.join();
         }
@@ -181,7 +235,7 @@ const JOB_BLOCKS: usize = 256;
 pub(super) struct Encoding {
     inline: Option<Result<Batch>>,
     queued: VecDeque<Input>,
-    running: VecDeque<crossbeam_channel::Receiver<Result<Batch>>>,
+    running: VecDeque<std::sync::mpsc::Receiver<Result<Batch>>>,
     pool: Option<Arc<SharedPool>>,
     policy: Policy,
     failed: bool,
@@ -189,13 +243,14 @@ pub(super) struct Encoding {
 impl Encoding {
     fn submit(&mut self) -> Result<()> {
         if let Some(input) = self.queued.pop_front() {
-            let (result, rx) = crossbeam_channel::bounded(1);
+            // Exactly one result per job; the single-use channel cannot grow.
+            // Use the blocking standard channel instead of yielding on a
+            // crossbeam bounded array while the encoder is running.
+            let (result, rx) = std::sync::mpsc::channel();
             self.pool
                 .as_ref()
                 .unwrap()
-                .tx
-                .as_ref()
-                .unwrap()
+                .jobs
                 .send(Job {
                     input,
                     policy: self.policy,
@@ -229,7 +284,7 @@ impl Iterator for Encoding {
 impl Pool {
     pub fn encode(
         &mut self,
-        pending: &BTreeMap<u64, Arc<[u8; PAGE]>>,
+        pending: &super::memory::Map<super::buffer::Block>,
         policy: Policy,
     ) -> Result<Encoding> {
         ensure!(
@@ -248,6 +303,7 @@ impl Pool {
             stream.inline = Some(prepare(
                 pending.iter().map(|(&l, b)| (l, b.clone())).collect(),
                 policy,
+                None,
             ));
             return Ok(stream);
         }
@@ -277,6 +333,35 @@ impl Pool {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn job_queue_close_releases_senders_and_drains_admitted_jobs() {
+        use super::*;
+        let jobs = Arc::new(Jobs::default());
+        let job = || Job {
+            input: Vec::new(),
+            policy: Policy {
+                compression: Codec::Lz4,
+                dedupe: false,
+            },
+            result: std::sync::mpsc::channel().0,
+        };
+        for _ in 0..4 {
+            jobs.send(job()).unwrap();
+        }
+        let blocked = jobs.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = thread::spawn(move || {
+            tx.send(blocked.send(job()).is_err()).unwrap();
+        });
+        jobs.close();
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
+        sender.join().unwrap();
+        for _ in 0..4 {
+            assert!(jobs.recv().is_some());
+        }
+        assert!(jobs.recv().is_none());
+    }
+
     use super::*;
     #[test]
     #[ignore = "manual codec throughput/ratio diagnostic, outside FSKit acceptance"]
@@ -336,7 +421,9 @@ mod tests {
     }
     #[test]
     fn stream_bounds_inflight_jobs_and_can_be_abandoned() -> Result<()> {
-        let input = (0..4096).map(|i| (i, Arc::new([i as u8; PAGE]))).collect();
+        let input = (0..4096)
+            .map(|i| (i, Box::new([i as u8; PAGE]).into()))
+            .collect();
         let mut pool = Pool::default();
         let mut stream = pool.encode(&input, Policy::default())?;
         let workers = stream.pool.as_ref().unwrap().workers.len();
@@ -378,7 +465,7 @@ mod tests {
     }
     #[test]
     fn parallel_blocks_decode_independently_across_policy_switches() -> Result<()> {
-        let mut input = BTreeMap::new();
+        let mut input = super::super::memory::Map::new();
         let mut seed = 17u64;
         for i in 0..257 {
             let mut b = [0; PAGE];
@@ -393,7 +480,7 @@ mod tests {
             } else if i % 3 == 1 {
                 b[1024..].fill(i as u8);
             }
-            input.insert(i, Arc::new(b));
+            input.insert(i, Box::new(b).into());
         }
         let mut pool = Pool::default();
         for (compression, dedupe) in [Codec::Lz4, Codec::None, Codec::Zstd, Codec::Lz4]
@@ -414,7 +501,7 @@ mod tests {
                 if batch.packed {
                     assert_eq!(batch.bytes.len() % PAGE, 0);
                 }
-                for block in batch.blocks {
+                for block in &batch.blocks {
                     assert_eq!(block.lba, seen);
                     seen += 1;
                     let mut out = [0; PAGE];

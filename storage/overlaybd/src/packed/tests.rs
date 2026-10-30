@@ -1078,3 +1078,256 @@ fn asynchronous_punch_reserves_ranges_without_stalling_flush_and_poison_on_error
     }
     Ok(())
 }
+
+#[test]
+fn queued_data_is_readable_and_flush_waits_for_actual_io() -> Result<()> {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Condvar,
+    };
+    #[derive(Default)]
+    struct HeldWrite {
+        model: Model,
+        held: Mutex<bool>,
+        entered: Condvar,
+        release: Condvar,
+        waiting: AtomicBool,
+        fail: AtomicBool,
+    }
+    impl Disk for HeldWrite {
+        fn read(&self, o: u64, b: &mut [u8]) -> Result<()> {
+            self.model.read(o, b)
+        }
+        fn write(&self, o: u64, b: &[u8]) -> Result<()> {
+            let mut held = self.held.lock().unwrap();
+            while *held {
+                self.waiting.store(true, Ordering::Release);
+                self.entered.notify_all();
+                held = self.release.wait(held).unwrap();
+            }
+            drop(held);
+            if self.fail.load(Ordering::Acquire) {
+                bail!("injected queued write failure");
+            }
+            self.model.write(o, b)
+        }
+        fn barrier(&self) -> Result<()> {
+            self.model.barrier()
+        }
+        fn len(&self) -> Result<u64> {
+            self.model.len()
+        }
+        fn allocated(&self) -> Result<u64> {
+            self.model.allocated()
+        }
+        fn punch(&self, o: u64, n: u64) -> Result<()> {
+            self.model.punch(o, n)
+        }
+    }
+    struct Release(Arc<HeldWrite>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0.held.lock().unwrap() = false;
+            self.0.release.notify_all();
+        }
+    }
+    for fail in [false, true] {
+        let disk = Arc::new(HeldWrite::default());
+        let mut core = Core::create(disk.clone(), PAGE as u64 * 16, policy(Codec::None, false))?;
+        core.stage(0, Box::new([1; PAGE]))?;
+        core.commit()?;
+        core.async_data = true;
+        *disk.held.lock().unwrap() = true;
+        let release = Release(disk.clone());
+        core.stage(0, Box::new([2; PAGE]))?;
+        core.writeback()?;
+        {
+            let held = disk.held.lock().unwrap();
+            let (_held, timeout) = disk
+                .entered
+                .wait_timeout_while(held, std::time::Duration::from_secs(5), |_| {
+                    !disk.waiting.load(Ordering::Acquire)
+                })
+                .unwrap();
+            assert!(!timeout.timed_out());
+        }
+        let pinned = core.view();
+        core.stage(0, Box::new([3; PAGE]))?;
+        core.stage(1, Box::new([4; PAGE]))?;
+        core.writeback()?;
+        assert_eq!(*pinned.read(0)?.unwrap(), [2; PAGE]);
+        assert_eq!(*core.read_block(0)?.unwrap(), [3; PAGE]);
+        assert_eq!(*core.read_block(1)?.unwrap(), [4; PAGE]);
+        let (tx, rx) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let result = core.commit();
+            tx.send(result.is_ok()).unwrap();
+            core
+        });
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(30))
+            .is_err());
+        disk.fail.store(fail, Ordering::Release);
+        drop(release);
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5))?, !fail);
+        let mut core = join.join().unwrap();
+        if fail {
+            assert!(core.stage(2, Box::new([9; PAGE])).is_err());
+        }
+        drop(core);
+        drop(pinned);
+        disk.model.cut(0, false);
+        let reopened = Core::open(disk, Policy::default())?;
+        assert_eq!(
+            *reopened.read_block(0)?.unwrap(),
+            [if fail { 1 } else { 3 }; PAGE]
+        );
+        if !fail {
+            assert_eq!(*reopened.read_block(1)?.unwrap(), [4; PAGE]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn queued_data_faults_survive_reordered_and_torn_power_loss() -> Result<()> {
+    let disk = Arc::new(Model::default());
+    let mut core = Core::create(disk.clone(), PAGE as u64 * 16, Policy::default())?;
+    core.stage(0, Box::new([1; PAGE]))?;
+    core.commit()?;
+    drop(core);
+    let initial = disk.0.lock().unwrap().clone();
+    fn update(core: &mut Core) -> Result<()> {
+        core.async_data = true;
+        core.stage(0, Box::new([2; PAGE]))?;
+        core.writeback()?;
+        core.stage(0, Box::new([3; PAGE]))?;
+        core.stage(1, Box::new([4; PAGE]))?;
+        core.writeback()?;
+        core.commit()
+    }
+    let probe = Model::from(initial.clone());
+    let mut core = Core::open(probe.clone(), Policy::default())?;
+    update(&mut core)?;
+    drop(core);
+    let count = probe.0.lock().unwrap().ops - initial.ops;
+    for failure in 1..=count + 1 {
+        for errno in [libc::EIO, libc::ENOSPC] {
+            for mask in [0, u64::MAX, 0x5555555555555555, 0xaaaaaaaaaaaaaaaa] {
+                for torn in [false, true] {
+                    let disk = Model::from(initial.clone());
+                    {
+                        let mut s = disk.0.lock().unwrap();
+                        s.fail = Some(initial.ops + failure);
+                        s.errno = errno;
+                        s.short_write = torn;
+                    }
+                    let mut core = Core::open(disk.clone(), Policy::default())?;
+                    let acknowledged = update(&mut core).is_ok();
+                    if !acknowledged {
+                        assert!(core.stage(2, Box::new([9; PAGE])).is_err());
+                    }
+                    // Join queued I/O before applying the simulated power cut.
+                    drop(core);
+                    disk.cut(mask, torn);
+                    let recovered = Core::open(disk, Policy::default())?;
+                    let value = *recovered.read_block(0)?.unwrap();
+                    if acknowledged {
+                        assert_eq!(value, [3; PAGE]);
+                    } else {
+                        assert!(value == [1; PAGE] || value == [3; PAGE]);
+                    }
+                    if value == [3; PAGE] {
+                        assert_eq!(*recovered.read_block(1)?.unwrap(), [4; PAGE]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn mixed_size_batches_cross_segments_and_reopen_after_overwrite() -> Result<()> {
+    let disk = Arc::new(Model::default());
+    let mut core = Core::create(disk.clone(), 2048 * PAGE as u64, Policy::default())?;
+    let mut expected = vec![Box::new([0; PAGE]); 2048];
+    let mut seed = 991u64;
+    for (round, codec) in [Codec::Lz4, Codec::Zstd, Codec::None, Codec::Lz4]
+        .into_iter()
+        .enumerate()
+    {
+        core.set_policy(policy(codec, false))?;
+        core.async_data = true;
+        for (lba, block) in expected.iter_mut().enumerate() {
+            if round != 0 && lba % 3 != round % 3 {
+                continue;
+            }
+            for word in block.chunks_exact_mut(8) {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                word.copy_from_slice(&seed.to_le_bytes());
+            }
+            if lba % 7 != 0 {
+                let prefix = 256 + (lba % 13) * 256;
+                for at in prefix..PAGE {
+                    block[at] = block[at % 256];
+                }
+            }
+            if lba % 17 == 0 {
+                block.fill(0);
+            }
+            core.stage(lba as u64, block.clone())?;
+        }
+        core.writeback()?;
+        for lba in (0..2048).step_by(31) {
+            assert_eq!(core.read_block(lba as u64)?.unwrap(), expected[lba]);
+        }
+        core.commit()?;
+        drop(core);
+        disk.cut(0, false);
+        core = Core::open(disk.clone(), Policy::default())?;
+        for (lba, block) in expected.iter().enumerate() {
+            assert_eq!(&core.read_block(lba as u64)?.unwrap(), block);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streamed_mixed_capacity_buffers_preserve_contents() -> Result<()> {
+    use super::{disk::FileDisk, PackedUpper};
+    use crate::io::virtual_file::VirtualFile;
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("stream.packed");
+    let size = 128 * 1024 * 1024u64;
+    PackedUpper::create(&path, size, Policy::default())?;
+    let upper = PackedUpper::open(&path, None, Policy::default()).await?;
+    let mut data = vec![0; 1024 * 1024];
+    let mut random = 4981u64;
+    for block in data.chunks_exact_mut(PAGE) {
+        for b in &mut block[..2048] {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            *b = random as u8;
+        }
+        for i in 2048..PAGE {
+            block[i] = block[i % 256];
+        }
+    }
+    for at in (0..size).step_by(data.len()) {
+        upper.write_at(at, &data).await?;
+    }
+    upper.sync().await?;
+    drop(upper);
+    let core = Core::open(Arc::new(FileDisk::open(&path, false)?), Policy::default())?;
+    for lba in 0..size / PAGE as u64 {
+        assert_eq!(
+            core.read_block(lba)?.unwrap().as_slice(),
+            &data[(lba as usize * PAGE) % data.len()..(lba as usize * PAGE) % data.len() + PAGE]
+        );
+    }
+    Ok(())
+}

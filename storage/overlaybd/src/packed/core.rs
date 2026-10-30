@@ -39,6 +39,8 @@ pub struct Stats {
     pub generations: u64,
     pub writeback_batches: u64,
     pub prefetched_batches: u64,
+    pub packed_batches: u64,
+    pub fragmented_batches: u64,
     pub writeback_ns: u64,
     pub barriers: u64,
     pub barrier_ns: u64,
@@ -69,6 +71,9 @@ pub struct Stats {
     pub reclaimable_bytes: u64,
     pub reclaimed_bytes: u64,
     pub dirty_bytes: usize,
+    pub plaintext_buffer_bytes: usize,
+    pub frontend_stage_ns: u64,
+    pub frontend_wait_ns: u64,
     pub metadata_pages_written: u64,
     pub metadata_write_calls: u64,
 }
@@ -237,6 +242,22 @@ impl Pages for Allocation {
         Ok(())
     }
 }
+struct PackedRun {
+    offset: u64,
+    shift_at: usize,
+    shift: usize,
+}
+impl PackedRun {
+    fn at(&self, offset: usize) -> u64 {
+        self.offset
+            + (offset
+                + if offset >= self.shift_at {
+                    self.shift
+                } else {
+                    0
+                }) as u64
+    }
+}
 impl Allocation {
     fn page(&mut self) -> u64 {
         if let Some(p) = self.free.pop_first() {
@@ -276,11 +297,14 @@ impl Allocation {
         let offset = page * PAGE as u64;
         if !self.output.is_empty()
             && (self.output_offset + self.output.len() as u64 != offset
-                || self.output.len() >= 1024 * 1024)
+                || self.output.len() >= super::writeback::WRITE_BYTES)
         {
             self.flush_data()?;
         }
         if self.output.is_empty() {
+            // Recycled encoder buffers have arbitrary capacities. Geometric
+            // growth from those sizes could exceed the writer's 2 MiB limit.
+            self.output.reserve_exact(super::writeback::WRITE_BYTES);
             self.output_offset = offset;
         }
         Ok(())
@@ -304,63 +328,113 @@ impl Allocation {
     }
 
     // Compression workers already laid out independent objects at 64-byte
-    // boundaries. Reserve one contiguous run and copy/write the whole batch.
+    // boundaries. Reserve one contiguous run and hand the allocation to the writer.
     // Fragmented free space uses the per-object path instead of growing forever
     // while ignoring reusable holes. Search work is bounded per batch.
-    fn packed_batch(&mut self, bytes: &[u8]) -> Result<Option<u64>> {
+    fn packed_batch(
+        &mut self,
+        bytes: &mut Vec<u8>,
+        spans: &[(usize, usize)],
+    ) -> Result<Option<PackedRun>> {
         if bytes.is_empty() {
-            return Ok(Some(0));
+            return Ok(Some(PackedRun {
+                offset: 0,
+                shift_at: usize::MAX,
+                shift: 0,
+            }));
         }
         ensure!(
             bytes.len() % PAGE == 0 && bytes.len() as u64 <= SEGMENT,
             "invalid packed batch"
         );
-        let count = (bytes.len() / PAGE) as u64;
-        let start = if self.free.is_empty() {
+        // A batch may span segments; an individual encoded object may not.
+        // Shift only the crossing object and its successors, instead of leaving
+        // an almost-full-batch-sized hole at every segment boundary.
+        let content_end = spans
+            .iter()
+            .map(|(at, len)| at + len)
+            .max()
+            .unwrap_or(bytes.len());
+        let layout = |start: u64| {
+            let boundary = (SEGMENT - start * PAGE as u64 % SEGMENT) as usize;
+            let crossing = spans
+                .iter()
+                .find(|&&(at, len)| at < boundary && at + len > boundary);
+            let (shift_at, shift) =
+                crossing.map_or((usize::MAX, 0), |&(at, _)| (at, boundary - at));
+            let count = (content_end + shift).div_ceil(PAGE) as u64;
+            (shift_at, shift, count)
+        };
+        // A few tiny holes should not force an entire large batch through the
+        // per-object path. Leave less than one batch of holes for metadata/small
+        // writes; once enough total space exists, reuse it even if fragmented.
+        // Thus this preference cannot accumulate an unbounded free-space tail.
+        let (start, shift_at, shift, count) = if self.free.len() < bytes.len() / PAGE {
             let pages_per_segment = SEGMENT / PAGE as u64;
-            if self.end % pages_per_segment + count > pages_per_segment {
-                self.end = (self.end / pages_per_segment + 1) * pages_per_segment;
-            }
-            if self.excluded == Some(self.end / pages_per_segment) {
-                self.end += pages_per_segment - self.end % pages_per_segment;
+            let (_, _, count) = layout(self.end);
+            if let Some(excluded) = self.excluded {
+                if self.end / pages_per_segment <= excluded
+                    && (self.end + count - 1) / pages_per_segment >= excluded
+                {
+                    self.end = (excluded + 1) * pages_per_segment;
+                }
             }
             let start = self.end;
+            let (at, shift, count) = layout(start);
+            if count as usize * PAGE > super::writeback::WRITE_BYTES {
+                return Ok(None);
+            }
             self.end += count;
-            start
+            (start, at, shift, count)
         } else {
             let mut run = 0;
             let mut start = 0;
             let mut found = None;
             for &page in self.free.iter().take(4096) {
-                if run == 0
-                    || page != start + run
-                    || page * PAGE as u64 / SEGMENT != start * PAGE as u64 / SEGMENT
-                {
+                if self.excluded == Some(page * PAGE as u64 / SEGMENT) {
+                    run = 0;
+                    continue;
+                }
+                if run == 0 || page != start + run {
                     start = page;
                     run = 0;
                 }
                 run += 1;
-                if run == count {
-                    found = Some(start);
-                    break;
+                if run as usize * PAGE >= bytes.len() {
+                    let (at, shift, count) = layout(start);
+                    if run >= count && count as usize * PAGE <= super::writeback::WRITE_BYTES {
+                        found = Some((start, at, shift, count));
+                        break;
+                    }
                 }
             }
-            let Some(start) = found else {
+            let Some(found) = found else {
                 return Ok(None);
             };
-            for page in start..start + count {
+            for page in found.0..found.0 + found.3 {
                 self.free.remove(&page);
                 self.cache.invalidate(page);
             }
-            start
+            found
         };
-        self.finish_pack()?;
-        if self.output.len() + bytes.len() > 1024 * 1024 {
-            self.flush_data()?;
+        if shift != 0 {
+            bytes.resize(count as usize * PAGE, 0);
+            bytes.copy_within(shift_at..content_end, shift_at + shift);
+            bytes[shift_at..shift_at + shift].fill(0);
+            bytes[content_end + shift..].fill(0);
         }
-        self.start_page(start)?;
-        self.output.extend_from_slice(bytes);
-        Ok(Some(start * PAGE as u64))
+        self.finish_pack()?;
+        self.flush_data()?;
+        self.write_calls += 1;
+        self.write_bytes += bytes.len() as u64;
+        *bytes = self
+            .writer
+            .submit(start * PAGE as u64, std::mem::take(bytes), false)?;
+        Ok(Some(PackedRun {
+            offset: start * PAGE as u64,
+            shift_at,
+            shift,
+        }))
     }
 
     fn payload(&mut self, b: &[u8]) -> Result<u64> {
@@ -407,6 +481,7 @@ impl Allocation {
 
 #[derive(Clone)]
 pub struct ReadView {
+    writes: Arc<super::writeback::ReadCache>,
     root: Arc<Root>,
     disk: Arc<dyn Disk>,
     poison: Arc<std::sync::Mutex<Option<String>>>,
@@ -439,7 +514,7 @@ impl ReadView {
     }
     fn decode(&self, v: &Value) -> Result<Box<[u8; PAGE]>> {
         let mut stored = vec![0; v[1] as usize];
-        self.disk.read(v[0], &mut stored)?;
+        self.writes.read(self.disk.as_ref(), v[0], &mut stored)?;
         let mut out = Box::new([0; PAGE]);
         match v[2] {
             0 => out.copy_from_slice(&stored),
@@ -480,6 +555,8 @@ struct Punching {
     done: std::sync::mpsc::Receiver<(Result<()>, u64, u64, u64)>,
 }
 pub struct Core {
+    pub async_data: bool,
+    writes: Arc<super::writeback::ReadCache>,
     disk: Arc<dyn Disk>,
     roots: [Option<Arc<Root>>; 2],
     current: usize,
@@ -490,7 +567,7 @@ pub struct Core {
     map_delta: Map<u64>,
     object_delta: Map<Option<Value>>,
     pub policy: Policy,
-    pub pending: Arc<BTreeMap<u64, Arc<[u8; PAGE]>>>,
+    pub pending: Arc<super::memory::Map<super::buffer::Block>>,
     poison: Arc<std::sync::Mutex<Option<String>>>,
     dedupe: HashMap<[u8; 32], u64>,
     encoders: super::encode::Pool,
@@ -529,6 +606,8 @@ impl Core {
         disk.write(PAGE as u64, &[0; PAGE])?;
         disk.barrier()?;
         Ok(Self {
+            async_data: false,
+            writes: Arc::new(super::writeback::ReadCache::default()),
             disk,
             roots: [Some(Arc::new(root)), None],
             current: 0,
@@ -537,7 +616,7 @@ impl Core {
             map_delta: Map::new(),
             object_delta: Map::new(),
             policy,
-            pending: Arc::new(BTreeMap::new()),
+            pending: Arc::new(Map::new()),
             poison: Arc::new(std::sync::Mutex::new(None)),
             dedupe: HashMap::new(),
             encoders: super::encode::Pool::default(),
@@ -581,6 +660,8 @@ impl Core {
             );
         }
         Ok(Self {
+            async_data: false,
+            writes: Arc::new(super::writeback::ReadCache::default()),
             disk,
             roots,
             current,
@@ -589,7 +670,7 @@ impl Core {
             map_delta: Map::new(),
             object_delta: Map::new(),
             policy,
-            pending: Arc::new(BTreeMap::new()),
+            pending: Arc::new(Map::new()),
             poison: Arc::new(std::sync::Mutex::new(None)),
             dedupe: HashMap::new(),
             encoders: super::encode::Pool::default(),
@@ -694,6 +775,7 @@ impl Core {
     }
     fn protected(&self) -> PageSet {
         let mut protected = self.protected_roots();
+        self.writes.protect(&mut protected);
         if let Some(punching) = &self.punching {
             protected.extend(punching.pages.iter().copied());
         }
@@ -701,6 +783,7 @@ impl Core {
     }
     pub fn view(&self) -> ReadView {
         ReadView {
+            writes: self.writes.clone(),
             root: self
                 .working
                 .as_ref()
@@ -845,14 +928,19 @@ impl Core {
             .generation
             .checked_add(1)
             .context("packed generation overflow")?;
-        let end = self.disk.len()?.div_ceil(PAGE as u64).max(2);
+        let end = self
+            .disk
+            .len()?
+            .max(self.writes.end())
+            .div_ceil(PAGE as u64)
+            .max(2);
         let protected = self.protected();
         let free = protected
             .holes(end)
             .filter(|p| victim != Some(*p * PAGE as u64 / SEGMENT))
             .collect();
         let mut output = std::mem::take(&mut self.output_buffer);
-        output.reserve(1024 * 1024);
+        output.reserve_exact(super::writeback::WRITE_BYTES);
         let mut a = Allocation {
             disk: self.disk.clone(),
             free,
@@ -872,14 +960,18 @@ impl Core {
             queue_wait_ns: 0,
             writer: match self.data_writer.take() {
                 Some(writer) => writer,
-                None => super::writeback::Writer::new(self.disk.clone(), self.poison.clone())?,
+                None => super::writeback::Writer::new(
+                    self.disk.clone(),
+                    self.poison.clone(),
+                    self.writes.clone(),
+                )?,
             },
         };
         self.stats.prepare_ns += prepare_started.elapsed().as_nanos() as u64;
         let objects_started = Instant::now();
         let (mut maps, mut objects) = (Vec::new(), Map::new());
         let pending = self.pending.clone();
-        let mut fresh: HashMap<[u8; 32], (u64, Arc<[u8; PAGE]>)> = HashMap::new();
+        let mut fresh: HashMap<[u8; 32], (u64, super::buffer::Block)> = HashMap::new();
         let encoding_started = Instant::now();
         let mut batches = match self.prepared.take() {
             Some(prepared) => {
@@ -894,12 +986,20 @@ impl Core {
             let batch = batches.next();
             self.stats.encoding_wait_ns += waiting.elapsed().as_nanos() as u64;
             let Some(batch) = batch else { break };
-            let batch = batch?;
+            let mut batch = batch?;
             let packed_at = if batch.packed {
-                a.packed_batch(&batch.bytes)?
+                let spans: Vec<_> = batch.blocks.iter().map(|b| (b.offset, b.len)).collect();
+                a.packed_batch(&mut batch.bytes, &spans)?
             } else {
                 None
             };
+            if batch.packed {
+                if packed_at.is_some() {
+                    self.stats.packed_batches += 1;
+                } else {
+                    self.stats.fragmented_batches += 1;
+                }
+            }
             let batch_start = maps.len();
             let mut new_objects = Vec::with_capacity(batch.blocks.len());
             for encoded in &batch.blocks {
@@ -939,16 +1039,18 @@ impl Core {
                         if encoded.fallback {
                             self.stats.compression_fallbacks += 1;
                         }
-                        let bytes = if codec == 0 {
-                            b.as_slice()
-                        } else {
-                            &batch.bytes[encoded.offset..encoded.offset + encoded.len]
+                        let offset = match &packed_at {
+                            Some(run) => run.at(encoded.offset),
+                            None => {
+                                let bytes = if codec == 0 {
+                                    b.as_slice()
+                                } else {
+                                    &batch.bytes[encoded.offset..encoded.offset + encoded.len]
+                                };
+                                a.payload(bytes)?
+                            }
                         };
-                        let offset = match packed_at {
-                            Some(start) => start + encoded.offset as u64,
-                            None => a.payload(bytes)?,
-                        };
-                        let value = [offset, bytes.len() as u64, codec, encoded.crc, 1, 0];
+                        let value = [offset, encoded.len as u64, codec, encoded.crc, 1, 0];
                         if self.policy.dedupe {
                             next.objects.insert(id, value);
                             objects.insert(id, Some(value));
@@ -1036,9 +1138,16 @@ impl Core {
         // Only immutable old tree nodes are read during the COW traversal.
         // New nodes may be coalesced, but must reach the file before barrier one.
         a.flush_data()?;
-        // Both payload and COW metadata must complete before root exposure and
-        // before either publication barrier. No reader can observe queued data.
-        a.finish_io()?;
+        // Volatile working roots read queued payloads through the bounded cache.
+        // Durable roots still drain ALL prior data/metadata before barrier one.
+        if durable || !self.async_data {
+            a.finish_io()?;
+        } else {
+            let timings = a.writer.progress()?;
+            a.io_ns += timings.data_ns;
+            a.metadata_io_ns += timings.metadata_ns;
+            a.queue_wait_ns += timings.wait_ns;
+        }
         self.stats.payload_io_ns += a.io_ns;
         self.stats.metadata_io_ns += a.metadata_io_ns;
         self.stats.data_queue_wait_ns += a.queue_wait_ns;
@@ -1138,7 +1247,7 @@ impl Core {
             self.working = Some(Arc::new(next));
         }
         self.readers.retain(|r| r.strong_count() > 0);
-        self.pending = Arc::new(BTreeMap::new());
+        self.pending = Arc::new(Map::new());
         if self.policy.dedupe {
             for (h, (id, _)) in fresh {
                 if self.dedupe.len() >= 262144 {
@@ -1467,6 +1576,7 @@ mod allocation_tests {
             writer: super::super::writeback::Writer::new(
                 disk.clone(),
                 Arc::new(std::sync::Mutex::new(None)),
+                Arc::new(super::super::writeback::ReadCache::default()),
             )?,
         };
         let sizes = [1, 63, 64, 65, 2049, 2050, 4032, 4095, 4096];
@@ -1498,7 +1608,7 @@ mod allocation_tests {
         a.end = 8 * SEGMENT / PAGE as u64 - 1;
         a.excluded = Some(8);
         let bytes = vec![93; PAGE * 2];
-        let offset = a.packed_batch(&bytes)?.unwrap();
+        let offset = a.packed_batch(&mut bytes.clone(), &[])?.unwrap().offset;
         assert_eq!(offset, 9 * SEGMENT);
         a.flush_data()?;
         a.finish_io()?;
@@ -1507,13 +1617,45 @@ mod allocation_tests {
         assert_eq!(actual, bytes);
         // Reuse a sufficiently large hole; leave isolated holes for fallback.
         a.free = [3, 5, 10, 11].into_iter().collect();
-        assert_eq!(a.packed_batch(&bytes)?, Some(10 * PAGE as u64));
-        assert_eq!(a.packed_batch(&bytes)?, None);
+        assert_eq!(
+            a.packed_batch(&mut bytes.clone(), &[])?.map(|r| r.offset),
+            Some(10 * PAGE as u64)
+        );
+        assert!(a.packed_batch(&mut bytes.clone(), &[])?.is_none());
         assert_eq!(a.free, [3, 5].into_iter().collect());
         a.flush_data()?;
         a.finish_io()?;
         disk.read(10 * PAGE as u64, &mut actual)?;
         assert_eq!(actual, bytes);
+        // Keep the batch contiguous across a segment boundary, but pad only the
+        // object which would straddle it. Exercise both append and reused runs.
+        for reuse in [false, true] {
+            let start = 10 * SEGMENT / PAGE as u64 - 1;
+            a.end = start;
+            a.excluded = None;
+            a.free = if reuse {
+                (start..start + 3).collect()
+            } else {
+                BTreeSet::new()
+            };
+            let spans = [(0, 3000), (3008, 4096), (7104, 500)];
+            let mut packed = vec![0; 8192];
+            for (i, &(at, len)) in spans.iter().enumerate() {
+                packed[at..at + len].fill(i as u8 + 11);
+            }
+            let run = a.packed_batch(&mut packed, &spans)?.unwrap();
+            assert_eq!(run.offset, start * PAGE as u64);
+            assert_eq!(run.shift, 1088);
+            a.flush_data()?;
+            a.finish_io()?;
+            for (i, &(at, len)) in spans.iter().enumerate() {
+                let offset = run.at(at);
+                assert!(offset % SEGMENT + len as u64 <= SEGMENT);
+                let mut actual = vec![0; len];
+                disk.read(offset, &mut actual)?;
+                assert_eq!(actual, vec![i as u8 + 11; len]);
+            }
+        }
         Ok(())
     }
 }

@@ -9,6 +9,31 @@ use std::{
     path::Path,
 };
 pub const PAGE: usize = 4096;
+#[derive(Default)]
+pub struct PublicationStats {
+    pub barriers: u64,
+    pub barrier_ns: u64,
+    pub peak: u64,
+}
+fn publish_steps(
+    mut header: impl FnMut() -> Result<()>,
+    mut barrier: impl FnMut() -> Result<()>,
+    mut allocated: impl FnMut() -> Result<u64>,
+    stats: &mut PublicationStats,
+) -> Result<()> {
+    for phase in 0..2 {
+        stats.peak = stats.peak.max(allocated()?);
+        let started = std::time::Instant::now();
+        let result = barrier();
+        stats.barriers += 1;
+        stats.barrier_ns += started.elapsed().as_nanos() as u64;
+        result?;
+        if phase == 0 {
+            header()?;
+        }
+    }
+    Ok(())
+}
 pub trait Disk: Send + Sync {
     fn read(&self, offset: u64, bytes: &mut [u8]) -> Result<()>;
     fn write(&self, offset: u64, bytes: &[u8]) -> Result<()>;
@@ -16,8 +41,16 @@ pub trait Disk: Send + Sync {
     fn len(&self) -> Result<u64>;
     fn punch(&self, offset: u64, length: u64) -> Result<()>;
     fn allocated(&self) -> Result<u64>;
+    fn publish(&self, offset: u64, header: &[u8], stats: &mut PublicationStats) -> Result<()> {
+        publish_steps(
+            || self.write(offset, header),
+            || self.barrier(),
+            || self.allocated(),
+            stats,
+        )
+    }
 }
-pub struct FileDisk(File);
+pub struct FileDisk(File, std::sync::Mutex<()>);
 impl FileDisk {
     pub fn open(path: &Path, create: bool) -> Result<Self> {
         let f = OpenOptions::new()
@@ -39,7 +72,7 @@ impl FileDisk {
         if create {
             f.set_len((PAGE * 2) as u64)?;
         }
-        Ok(Self(f))
+        Ok(Self(f, std::sync::Mutex::new(())))
     }
 }
 impl Disk for FileDisk {
@@ -48,28 +81,30 @@ impl Disk for FileDisk {
         Ok(())
     }
     fn write(&self, o: u64, b: &[u8]) -> Result<()> {
+        let _writing = self.1.lock().unwrap();
         self.0.write_all_at(b, o)?;
         Ok(())
     }
     fn barrier(&self) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        loop {
-            if unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
-                break;
-            }
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                return Err(e.into());
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        self.0.sync_all()?;
-        Ok(())
+        let _writing = self.1.lock().unwrap();
+        self.full_sync()
+    }
+    fn publish(&self, offset: u64, header: &[u8], stats: &mut PublicationStats) -> Result<()> {
+        // New payload writes must not extend either full-sync phase. Preparation
+        // and cached reads remain concurrent; only this file's physical writes wait.
+        let _writing = self.1.lock().unwrap();
+        publish_steps(
+            || self.0.write_all_at(header, offset).map_err(Into::into),
+            || self.full_sync(),
+            || self.allocated(),
+            stats,
+        )
     }
     fn len(&self) -> Result<u64> {
         Ok(self.0.metadata()?.len())
     }
     fn punch(&self, o: u64, n: u64) -> Result<()> {
+        let _writing = self.1.lock().unwrap();
         #[cfg(target_os = "macos")]
         {
             #[repr(C)]
@@ -109,5 +144,23 @@ impl Disk for FileDisk {
     fn allocated(&self) -> Result<u64> {
         use std::os::unix::fs::MetadataExt;
         Ok(self.0.metadata()?.blocks() * 512)
+    }
+}
+
+impl FileDisk {
+    fn full_sync(&self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        loop {
+            if unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e.into());
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.0.sync_all()?;
+        Ok(())
     }
 }

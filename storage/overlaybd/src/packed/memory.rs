@@ -4,10 +4,15 @@
 //! per object while keeping sparse keys compact and iteration ordered.
 use std::{collections::BTreeMap, ops::Index, sync::Arc};
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct Map<V: Clone> {
     chunks: BTreeMap<u64, Arc<Vec<(u64, V)>>>,
     len: usize,
+}
+impl<V: Clone> Default for Map<V> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl<V: Clone> Map<V> {
     pub fn new() -> Self {
@@ -15,6 +20,27 @@ impl<V: Clone> Map<V> {
             chunks: BTreeMap::new(),
             len: 0,
         }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn split_off(&mut self, key: &u64) -> Self {
+        let base = key / 256;
+        let mut chunks = self.chunks.split_off(&base);
+        if let Some(chunk) = chunks.remove(&base) {
+            let at = chunk.partition_point(|(k, _)| k < key);
+            if at == 0 {
+                chunks.insert(base, chunk);
+            } else if at == chunk.len() {
+                self.chunks.insert(base, chunk);
+            } else {
+                self.chunks.insert(base, Arc::new(chunk[..at].to_vec()));
+                chunks.insert(base, Arc::new(chunk[at..].to_vec()));
+            }
+        }
+        let len = chunks.values().map(|c| c.len()).sum();
+        self.len -= len;
+        Self { chunks, len }
     }
     pub fn len(&self) -> usize {
         self.len
@@ -268,6 +294,43 @@ impl FromIterator<u64> for PageSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn split_sparse_chunks_preserves_pinned_versions() {
+        for boundary in [0, 1, 19, 255, 256, 257, 511, 999, 1024, u64::MAX] {
+            let mut reference: BTreeMap<_, _> = (0..1024)
+                .filter(|n| n % 3 != 0)
+                .chain([u64::MAX])
+                .map(|k| (k, k))
+                .collect();
+            let mut map: Map<_> = reference.iter().map(|(&k, &v)| (k, v)).collect();
+            let pinned = map.clone();
+            let original = reference.clone();
+            let right = map.split_off(&boundary);
+            let right_ref = reference.split_off(&boundary);
+            assert_eq!(right.len(), right_ref.len());
+            assert_eq!(map.len(), reference.len());
+            assert_eq!(
+                map.iter()
+                    .map(|(&k, &v)| (k, v))
+                    .collect::<BTreeMap<_, _>>(),
+                reference
+            );
+            assert_eq!(
+                right
+                    .iter()
+                    .map(|(&k, &v)| (k, v))
+                    .collect::<BTreeMap<_, _>>(),
+                right_ref
+            );
+            assert_eq!(
+                pinned
+                    .iter()
+                    .map(|(&k, &v)| (k, v))
+                    .collect::<BTreeMap<_, _>>(),
+                original
+            );
+        }
+    }
     #[test]
     fn cow_chunks_preserve_old_roots_and_match_standard_collections() {
         let mut map = Map::new();

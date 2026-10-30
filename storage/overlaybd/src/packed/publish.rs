@@ -42,20 +42,15 @@ impl Publisher {
                         elapsed_ns: 0,
                         peak: 0,
                     };
-                    outcome.result = (|| {
-                        for phase in 0..2 {
-                            outcome.peak = outcome.peak.max(job.disk.allocated()?);
-                            let before = Instant::now();
-                            let result = job.disk.barrier();
-                            outcome.barriers += 1;
-                            outcome.barrier_ns += before.elapsed().as_nanos() as u64;
-                            result?;
-                            if phase == 0 {
-                                job.disk.write(job.slot as u64 * PAGE as u64, &job.header)?;
-                            }
-                        }
-                        Ok(())
-                    })();
+                    let mut durability = super::disk::PublicationStats::default();
+                    outcome.result = job.disk.publish(
+                        job.slot as u64 * PAGE as u64,
+                        &job.header,
+                        &mut durability,
+                    );
+                    outcome.barriers = durability.barriers;
+                    outcome.barrier_ns = durability.barrier_ns;
+                    outcome.peak = durability.peak;
                     outcome.elapsed_ns = started.elapsed().as_nanos() as u64;
                     if let Err(error) = &outcome.result {
                         *job.poison.lock().unwrap() = Some(format!("{error:#}"));

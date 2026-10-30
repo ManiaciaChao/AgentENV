@@ -23,9 +23,10 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Notify, RwLock};
-type Dirty = BTreeMap<u64, Arc<[u8; PAGE]>>;
+type Dirty = super::memory::Map<super::buffer::Block>;
 // Leave half the dirty budget available to the foreground while committing.
 const GENERATION_LIMIT: usize = DIRTY_LIMIT / 2;
+const PREPARE_THRESHOLD: usize = 2 * 1024 * 1024;
 
 struct Prepared {
     blocks: Arc<Dirty>,
@@ -37,7 +38,7 @@ struct Front {
     prepared: Option<Prepared>,
     pending: Dirty,
     inflight: Arc<Dirty>,
-    recycled: Vec<Arc<[u8; PAGE]>>,
+    pressure: bool,
     view: ReadView,
     sequence: u64,
     durable: u64,
@@ -75,6 +76,9 @@ impl Drop for RangeLease {
 struct Shared {
     front: Arc<Mutex<Front>>,
     notify: Arc<Notify>,
+    budget: Arc<super::buffer::Budget>,
+    stage_ns: std::sync::atomic::AtomicU64,
+    wait_ns: std::sync::atomic::AtomicU64,
     lower: Option<Arc<LSMTReadOnlyFile>>,
     size: u64,
     uuid: uuid::Uuid,
@@ -132,12 +136,13 @@ impl PackedUpper {
         Self::start(core, lower, size)
     }
     fn start(mut core: Core, lower: Option<Arc<LSMTReadOnlyFile>>, size: u64) -> Result<Self> {
+        core.async_data = true;
         let uuid = core.uuid();
         let front = Arc::new(Mutex::new(Front {
             prepared: None,
             pending: Dirty::new(),
             inflight: Arc::new(Dirty::new()),
-            recycled: Vec::new(),
+            pressure: false,
             view: core.view(),
             sequence: 0,
             durable: 0,
@@ -146,6 +151,7 @@ impl PackedUpper {
             stats: core.stats()?,
         }));
         let notify = Arc::new(Notify::new());
+        let budget = super::buffer::Budget::new(notify.clone());
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (wake, rx) = std::sync::mpsc::sync_channel(1);
         let (prefetch_wake, prefetch_rx) = std::sync::mpsc::sync_channel(1);
@@ -159,7 +165,7 @@ impl PackedUpper {
                 let mut f = prefetch_state.lock().unwrap();
                 if f.inflight.is_empty()
                     || f.prepared.is_some()
-                    || f.pending.len() * PAGE < GENERATION_LIMIT
+                    || f.pending.len() * PAGE < PREPARE_THRESHOLD
                 {
                     return Ok(false);
                 }
@@ -264,6 +270,7 @@ impl PackedUpper {
                         if f.prepared.is_none()
                             && !f.pending.is_empty()
                             && !needs_flush
+                            && !f.pressure
                             && f.pending.len() * PAGE < GENERATION_LIMIT
                             && (core.publication_pending()
                                 || last_commit.elapsed() < Duration::from_millis(100))
@@ -271,6 +278,7 @@ impl PackedUpper {
                             immediate = false;
                             continue;
                         }
+                        f.pressure = false;
                         if let Some(mut prepared) = f.prepared.take() {
                             // Avoid publishing only a prefix of an explicit flush
                             // when a newer pending batch must also be drained.
@@ -340,19 +348,7 @@ impl PackedUpper {
                     match result {
                         Ok(()) => {
                             f.view = core.view();
-                            let retired = std::mem::take(&mut f.inflight);
-                            // Recycle only after every owner of the immutable batch
-                            // has released it. Empty maintenance batches may still
-                            // have a Core owner; individual read pins are checked too.
-                            if let Ok(retired) = Arc::try_unwrap(retired) {
-                                for block in retired.into_values() {
-                                    if Arc::strong_count(&block) == 1
-                                        && f.recycled.len() + f.dirty_blocks() < DIRTY_LIMIT / PAGE
-                                    {
-                                        f.recycled.push(block);
-                                    }
-                                }
-                            }
+                            f.inflight = Arc::new(Dirty::new());
                             match statistics.unwrap() {
                                 Ok(stats) => f.stats = stats,
                                 Err(e) => f.view.fail(&e),
@@ -404,6 +400,9 @@ impl PackedUpper {
         Ok(Self(Arc::new(Shared {
             front,
             notify,
+            budget,
+            stage_ns: std::sync::atomic::AtomicU64::new(0),
+            wait_ns: std::sync::atomic::AtomicU64::new(0),
             lower,
             size,
             uuid,
@@ -437,33 +436,10 @@ impl PackedUpper {
         let boundary = self.0.front.lock().unwrap().sequence;
         self.wait_durable(boundary).await
     }
-    async fn stage(&self, lba: u64, block: Arc<[u8; PAGE]>) -> Result<()> {
-        loop {
-            let notified = self.0.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            {
-                let mut f = self.0.front.lock().unwrap();
-                f.view.check()?;
-                if f.pending.contains_key(&lba) || f.dirty_blocks() * PAGE < DIRTY_LIMIT {
-                    if let Some(old) = f.pending.insert(lba, block) {
-                        if Arc::strong_count(&old) == 1
-                            && f.recycled.len() + f.dirty_blocks() < DIRTY_LIMIT / PAGE
-                        {
-                            f.recycled.push(old);
-                        }
-                    }
-                    f.sequence = f
-                        .sequence
-                        .checked_add(1)
-                        .context("packed write sequence overflow")?;
-                    return Ok(());
-                }
-            }
-            let _ = self.0.wake.try_send(());
-            let _ = self.0.prefetch_wake.try_send(());
-            notified.await;
-        }
+    async fn stage(&self, lba: u64, block: Box<[u8; PAGE]>) -> Result<()> {
+        self.stage_aligned(lba * PAGE as u64, block.as_slice())
+            .await?;
+        Ok(())
     }
     async fn lock_range(&self, offset: u64, len: usize) -> RangeLease {
         let ranges = &self.0.ranges;
@@ -547,35 +523,39 @@ impl PackedUpper {
             let notified = self.0.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            let started = std::time::Instant::now();
             let (done, wake) = {
                 let mut f = self.0.front.lock().unwrap();
                 f.view.check()?;
-                let mut done = 0;
-                for chunk in bytes.chunks_exact(PAGE).take(32) {
-                    let lba = (offset + done as u64) / PAGE as u64;
-                    if !f.pending.contains_key(&lba) && f.dirty_blocks() * PAGE >= DIRTY_LIMIT {
-                        break;
-                    }
+                let count = (bytes.len() / PAGE)
+                    .min(32)
+                    .min(DIRTY_LIMIT / PAGE - f.dirty_blocks());
+                let count = count.min((DIRTY_LIMIT - self.0.budget.used()) / PAGE);
+                let len = count * PAGE;
+                if len == 0 {
+                    f.pressure = true;
+                    (0, true)
+                } else if let Some(lease) = self.0.budget.reserve(len) {
                     let sequence = f
                         .sequence
-                        .checked_add(1)
+                        .checked_add(count as u64)
                         .context("packed write sequence overflow")?;
-                    let mut block = f.recycled.pop().unwrap_or_else(|| Arc::new([0; PAGE]));
-                    Arc::get_mut(&mut block)
-                        .expect("exclusive recycled block")
-                        .copy_from_slice(chunk);
-                    if let Some(old) = f.pending.insert(lba, block) {
-                        if Arc::strong_count(&old) == 1
-                            && f.recycled.len() + f.dirty_blocks() < DIRTY_LIMIT / PAGE
-                        {
-                            f.recycled.push(old);
-                        }
-                    }
+                    let values: Vec<_> = super::buffer::Block::batch(&bytes[..len], lease)
+                        .enumerate()
+                        .map(|(i, block)| (offset / PAGE as u64 + i as u64, block))
+                        .collect();
+                    f.pending.replace_sorted(&values);
                     f.sequence = sequence;
-                    done += PAGE;
+                    (len, f.pending.len() * PAGE >= PREPARE_THRESHOLD)
+                } else {
+                    f.pressure = true;
+                    (0, true)
                 }
-                (done, f.pending.len() * PAGE >= GENERATION_LIMIT)
             };
+            self.0.stage_ns.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if wake || done == 0 {
                 let _ = self.0.wake.try_send(());
                 let _ = self.0.prefetch_wake.try_send(());
@@ -583,7 +563,12 @@ impl PackedUpper {
             if done != 0 {
                 return Ok(done);
             }
+            let waiting = std::time::Instant::now();
             notified.await;
+            self.0.wait_ns.fetch_add(
+                waiting.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
     async fn write_locked(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
@@ -597,19 +582,8 @@ impl PackedUpper {
             let lba = pos / PAGE as u64;
             let inside = (pos % PAGE as u64) as usize;
             let n = (PAGE - inside).min(bytes.len() - done);
-            let mut block = self
-                .0
-                .front
-                .lock()
-                .unwrap()
-                .recycled
-                .pop()
-                .unwrap_or_else(|| Arc::new([0; PAGE]));
-            let plain = Arc::get_mut(&mut block).expect("recycled block is exclusively owned");
-            if inside != 0 || n != PAGE {
-                plain.copy_from_slice(self.block(lba).await?.as_slice());
-            }
-            plain[inside..inside + n].copy_from_slice(&bytes[done..done + n]);
+            let mut block = self.block(lba).await?;
+            block[inside..inside + n].copy_from_slice(&bytes[done..done + n]);
             self.stage(lba, block).await?;
             done += n;
         }
@@ -720,6 +694,9 @@ impl PackedUpper {
             f.view.check()?;
             let mut stats = f.stats.clone();
             stats.dirty_bytes = f.dirty_blocks() * PAGE;
+            stats.plaintext_buffer_bytes = self.0.budget.used();
+            stats.frontend_stage_ns = self.0.stage_ns.load(std::sync::atomic::Ordering::Relaxed);
+            stats.frontend_wait_ns = self.0.wait_ns.load(std::sync::atomic::Ordering::Relaxed);
             Ok(stats)
         }
     }
@@ -832,6 +809,36 @@ impl VirtualFile for PackedUpper {
 mod generation_tests {
     use super::*;
     #[tokio::test]
+    async fn fragmented_slab_pressure_makes_progress() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let core = Core::create(
+            Arc::new(FileDisk::open(&dir.path().join("slabs"), true)?),
+            (DIRTY_LIMIT * 4) as u64,
+            Policy::default(),
+        )?;
+        let upper = PackedUpper::from_core(core)?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let batch = vec![5; PAGE * 32];
+            for round in 0..3u8 {
+                for i in 0..256 {
+                    let offset = (i * batch.len()) as u64;
+                    upper.write_at(offset, &batch).await?;
+                    upper.write_at(offset + PAGE as u64, &[round; PAGE]).await?;
+                    assert!(upper.stats()?.plaintext_buffer_bytes <= DIRTY_LIMIT);
+                }
+            }
+            upper.sync().await?;
+            for i in 0..256 {
+                let bytes = upper.read_at((i * PAGE * 32) as u64, PAGE * 2).await?;
+                assert_eq!(&bytes[..PAGE], &[5; PAGE]);
+                assert_eq!(&bytes[PAGE..], &[2; PAGE]);
+            }
+            anyhow::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+    #[tokio::test]
     async fn prepared_generation_preserves_read_order_and_dirty_budget() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let core = Core::create(
@@ -869,21 +876,27 @@ mod generation_tests {
         {
             let mut f = upper.0.front.lock().unwrap();
             f.inflight = Arc::new(
-                [(0, Arc::new([1; PAGE])), (1, Arc::new([1; PAGE]))]
-                    .into_iter()
-                    .collect(),
+                [
+                    (0, Box::new([1; PAGE]).into()),
+                    (1, Box::new([1; PAGE]).into()),
+                ]
+                .into_iter()
+                .collect(),
             );
             f.prepared = Some(Prepared {
                 blocks: Arc::new(
-                    [(0, Arc::new([2; PAGE])), (2, Arc::new([2; PAGE]))]
-                        .into_iter()
-                        .collect(),
+                    [
+                        (0, Box::new([2; PAGE]).into()),
+                        (2, Box::new([2; PAGE]).into()),
+                    ]
+                    .into_iter()
+                    .collect(),
                 ),
                 boundary: 2,
                 policy: Policy::default(),
                 encoding: None,
             });
-            f.pending.insert(0, Arc::new([3; PAGE]));
+            f.pending.insert(0, Box::new([3; PAGE]).into());
         }
         let mut bytes = vec![0; PAGE * 3];
         upper.read_at_into(0, &mut bytes).await?;
@@ -895,7 +908,7 @@ mod generation_tests {
             let mut f = upper.0.front.lock().unwrap();
             f.prepared.as_mut().unwrap().blocks = Arc::new(
                 (2..(DIRTY_LIMIT / PAGE - 1) as u64)
-                    .map(|lba| (lba, Arc::new([2; PAGE])))
+                    .map(|lba| (lba, Box::new([2; PAGE]).into()))
                     .collect(),
             );
         }
