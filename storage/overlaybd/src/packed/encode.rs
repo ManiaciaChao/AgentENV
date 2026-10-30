@@ -49,6 +49,9 @@ fn prepare(input: Input, policy: Policy, buffers: Option<&Buffers>) -> Result<Ba
         recycle: buffers.map(|b| b.tx.clone()),
         packed: !policy.dedupe,
     };
+    // Recycled partial batches must not geometrically grow past one job's
+    // maximum allocation as the next (larger) job fills them.
+    batch.bytes.reserve_exact(input.len() * PAGE);
     let mut scratch = [0u8; PAGE * 2];
     let mut zstd = if policy.compression == Codec::Zstd {
         Some(zstd::bulk::Compressor::new(1)?)
@@ -62,22 +65,38 @@ fn prepare(input: Input, policy: Policy, buffers: Option<&Buffers>) -> Result<Ba
         } else {
             [0; 32]
         };
+        let offset = batch.bytes.len();
         let (mut len, mut codec) = if zero {
             (0, 0)
         } else {
             match policy.compression {
                 Codec::None => (PAGE, 0),
                 Codec::Lz4 => {
+                    // Write directly into the packed allocation. A block that
+                    // cannot save one 64-byte allocation unit is stored raw.
+                    // SAFETY: the per-job reservation leaves at least PAGE spare
+                    // bytes for each remaining input block. LZ4 writes at most
+                    // dstCapacity bytes; only a successful initialized prefix is
+                    // exposed through Vec::set_len. Failed output is overwritten
+                    // by the raw fallback (or left outside len for dedupe).
+                    debug_assert!(batch.bytes.capacity() - offset >= PAGE);
                     let n = unsafe {
                         lz4_sys::LZ4_compress_default(
                             plain.as_ptr().cast(),
-                            scratch.as_mut_ptr().cast(),
+                            batch.bytes.as_mut_ptr().add(offset).cast(),
                             PAGE as i32,
-                            scratch.len() as i32,
+                            (PAGE - 64) as i32,
                         )
                     };
-                    ensure!(n > 0, "LZ4 compression failed");
-                    (n as usize, 1)
+                    ensure!(n >= 0, "LZ4 compression failed");
+                    if n > 0 {
+                        unsafe {
+                            batch.bytes.set_len(offset + n as usize);
+                        }
+                        (n as usize, 1)
+                    } else {
+                        (PAGE, 1)
+                    }
                 }
                 Codec::Zstd => (
                     zstd.as_mut()
@@ -92,11 +111,10 @@ fn prepare(input: Input, policy: Policy, buffers: Option<&Buffers>) -> Result<Ba
             len = PAGE;
             codec = 0;
         }
-        let offset = batch.bytes.len();
         if !zero {
-            if codec != 0 {
+            if codec == 2 {
                 batch.bytes.extend_from_slice(&scratch[..len]);
-            } else if batch.packed {
+            } else if codec == 0 && batch.packed {
                 batch.bytes.extend_from_slice(plain.as_slice());
             }
             if batch.packed {
@@ -461,6 +479,46 @@ mod tests {
         let b = SharedPool::acquire()?;
         assert!(Arc::ptr_eq(&a, &b));
         assert!((1..=4).contains(&a.workers.len()));
+        Ok(())
+    }
+    #[test]
+    fn incompressible_direct_output_falls_back_without_exposing_partial_encoding() -> Result<()> {
+        let mut seed = 371u64;
+        let mut input = Vec::new();
+        for lba in 0..JOB_BLOCKS {
+            let mut block = Box::new([0; PAGE]);
+            for byte in block.iter_mut() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *byte = seed as u8;
+            }
+            input.push((lba as u64, block.into()));
+        }
+        for dedupe in [false, true] {
+            let batch = prepare(
+                input.clone(),
+                Policy {
+                    compression: Codec::Lz4,
+                    dedupe,
+                },
+                None,
+            )?;
+            assert_eq!(
+                batch.bytes.len(),
+                if dedupe { 0 } else { JOB_BLOCKS * PAGE }
+            );
+            for block in &batch.blocks {
+                assert!(block.fallback);
+                assert_eq!(block.codec, 0);
+                if !dedupe {
+                    assert_eq!(
+                        &batch.bytes[block.offset..block.offset + PAGE],
+                        block.plain.as_slice()
+                    );
+                }
+            }
+        }
         Ok(())
     }
     #[test]

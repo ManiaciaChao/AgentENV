@@ -26,7 +26,9 @@ use tokio::sync::{Notify, RwLock};
 type Dirty = super::memory::Map<super::buffer::Block>;
 // Leave half the dirty budget available to the foreground while committing.
 const GENERATION_LIMIT: usize = DIRTY_LIMIT / 2;
-const PREPARE_THRESHOLD: usize = 2 * 1024 * 1024;
+// Four 1 MiB jobs keep all encoder workers busy without consuming the
+// entire next-generation plaintext allowance.
+const PREPARE_THRESHOLD: usize = 4 * 1024 * 1024;
 
 struct Prepared {
     blocks: Arc<Dirty>,
@@ -516,15 +518,15 @@ impl PackedUpper {
         Ok(block)
     }
     // Keep aligned bulk writes in bounded 128 KiB frontend batches. The range
-    // lease still serializes overlaps; one short lock admits data and assigns
-    // sequence numbers, without per-4-KiB async staging/lock round trips.
+    // lease still serializes overlaps. Short locks reserve capacity and publish
+    // mappings, with the immutable copy prepared between them.
     async fn stage_aligned(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
         loop {
             let notified = self.0.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let started = std::time::Instant::now();
-            let (done, wake) = {
+            let admitted = {
                 let mut f = self.0.front.lock().unwrap();
                 f.view.check()?;
                 let count = (bytes.len() / PAGE)
@@ -532,25 +534,36 @@ impl PackedUpper {
                     .min(DIRTY_LIMIT / PAGE - f.dirty_blocks());
                 let count = count.min((DIRTY_LIMIT - self.0.budget.used()) / PAGE);
                 let len = count * PAGE;
-                if len == 0 {
-                    f.pressure = true;
-                    (0, true)
-                } else if let Some(lease) = self.0.budget.reserve(len) {
-                    let sequence = f
-                        .sequence
-                        .checked_add(count as u64)
-                        .context("packed write sequence overflow")?;
-                    let values: Vec<_> = super::buffer::Block::batch(&bytes[..len], lease)
-                        .enumerate()
-                        .map(|(i, block)| (offset / PAGE as u64 + i as u64, block))
-                        .collect();
-                    f.pending.replace_sorted(&values);
-                    f.sequence = sequence;
-                    (len, f.pending.len() * PAGE >= PREPARE_THRESHOLD)
+                let lease = if len == 0 {
+                    None
                 } else {
+                    self.0.budget.reserve(len)
+                };
+                if lease.is_none() {
                     f.pressure = true;
-                    (0, true)
                 }
+                lease.map(|lease| (len, lease))
+            };
+            let (done, wake) = if let Some((len, lease)) = admitted {
+                // The reservation already counts against the shared budget.
+                // Keep copying/allocation outside Front so the coordinator and
+                // readers can advance independently. The caller's range lease
+                // and lifecycle gate protect ordering and flush admission.
+                let values: Vec<_> = super::buffer::Block::batch(&bytes[..len], lease)
+                    .enumerate()
+                    .map(|(i, block)| (offset / PAGE as u64 + i as u64, block))
+                    .collect();
+                let mut f = self.0.front.lock().unwrap();
+                f.view.check()?;
+                let sequence = f
+                    .sequence
+                    .checked_add((len / PAGE) as u64)
+                    .context("packed write sequence overflow")?;
+                f.pending.replace_sorted(&values);
+                f.sequence = sequence;
+                (len, f.pending.len() * PAGE >= PREPARE_THRESHOLD)
+            } else {
+                (0, true)
             };
             self.0.stage_ns.fetch_add(
                 started.elapsed().as_nanos() as u64,

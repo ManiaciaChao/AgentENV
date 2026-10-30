@@ -168,7 +168,7 @@ impl Writer {
             bytes
         }))
     }
-    pub fn submit(&mut self, offset: u64, bytes: Vec<u8>, metadata: bool) -> Result<Vec<u8>> {
+    pub fn submit(&mut self, offset: u64, mut bytes: Vec<u8>, metadata: bool) -> Result<Vec<u8>> {
         anyhow::ensure!(
             bytes.capacity() <= WRITE_BYTES,
             "packed write buffer exceeds limit: len={} capacity={} limit={}",
@@ -176,6 +176,12 @@ impl Writer {
             bytes.capacity(),
             WRITE_BYTES
         );
+        // Compression usually leaves much of the input-sized allocation unused.
+        // Return that capacity before charging the queue. This preserves the
+        // 4 MiB live-buffer limit while allowing more encoded work to overlap
+        // publication. Unlike copying into a new Arc slice, realloc can shrink
+        // these page-sized allocations in place; correctness does not require it.
+        bytes.shrink_to_fit();
         let mut recycled = None;
         while self.pending == QUEUE_DEPTH || self.pending_bytes + bytes.capacity() > QUEUE_BYTES {
             recycled = self.reap()?.or(recycled);
@@ -340,17 +346,19 @@ mod tests {
             Arc::new(ReadCache::default()),
         )?;
         let release = Release(release);
-        for offset in 0..2 {
+        let jobs = 8;
+        let part = QUEUE_BYTES / jobs;
+        for offset in 0..jobs {
             let mut short = Vec::with_capacity(WRITE_BYTES);
-            short.resize(super::super::disk::PAGE, 7);
-            writer.submit(offset as u64 * WRITE_BYTES as u64, short, false)?;
+            short.resize(part, 7);
+            writer.submit((offset * part) as u64, short, false)?;
         }
         ready.recv_timeout(std::time::Duration::from_secs(5))?;
-        assert_eq!(writer.pending, 2);
+        assert_eq!(writer.pending, jobs);
         assert_eq!(writer.pending_bytes, QUEUE_BYTES);
         let (tx, rx) = mpsc::channel();
         let join = std::thread::spawn(move || -> Result<()> {
-            writer.submit(2 * WRITE_BYTES as u64, vec![8; WRITE_BYTES], true)?;
+            writer.submit((jobs * part) as u64, vec![8; part], true)?;
             tx.send(())?;
             let timings = writer.finish()?;
             assert_eq!(writer.pending, 0);
@@ -365,7 +373,7 @@ mod tests {
         join.join().unwrap()?;
         assert_eq!(
             *disk.writes.lock().unwrap(),
-            vec![0, WRITE_BYTES as u64, 2 * WRITE_BYTES as u64]
+            (0..=jobs).map(|i| (i * part) as u64).collect::<Vec<_>>()
         );
         Ok(())
     }

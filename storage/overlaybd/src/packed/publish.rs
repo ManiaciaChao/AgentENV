@@ -12,6 +12,7 @@ pub(super) struct Outcome {
     pub result: Result<()>,
     pub barriers: u64,
     pub barrier_ns: u64,
+    pub phase_ns: [u64; 2],
     pub elapsed_ns: u64,
     pub peak: u64,
 }
@@ -39,6 +40,7 @@ impl Publisher {
                         result: Ok(()),
                         barriers: 0,
                         barrier_ns: 0,
+                        phase_ns: [0; 2],
                         elapsed_ns: 0,
                         peak: 0,
                     };
@@ -50,6 +52,7 @@ impl Publisher {
                     );
                     outcome.barriers = durability.barriers;
                     outcome.barrier_ns = durability.barrier_ns;
+                    outcome.phase_ns = durability.phase_ns;
                     outcome.peak = durability.peak;
                     outcome.elapsed_ns = started.elapsed().as_nanos() as u64;
                     if let Err(error) = &outcome.result {

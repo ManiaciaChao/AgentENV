@@ -44,6 +44,9 @@ pub struct Stats {
     pub writeback_ns: u64,
     pub barriers: u64,
     pub barrier_ns: u64,
+    pub publication_data_barrier_ns: u64,
+    pub publication_root_barrier_ns: u64,
+    pub publication_max_barrier_ns: u64,
     pub committed_blocks: u64,
     pub compression_fallbacks: u64,
     pub dedupe_hits: u64,
@@ -841,6 +844,13 @@ impl Core {
             let outcome = outcome?;
             self.stats.barriers += outcome.barriers;
             self.stats.barrier_ns += outcome.barrier_ns;
+            self.stats.publication_data_barrier_ns += outcome.phase_ns[0];
+            self.stats.publication_root_barrier_ns += outcome.phase_ns[1];
+            self.stats.publication_max_barrier_ns = self
+                .stats
+                .publication_max_barrier_ns
+                .max(outcome.phase_ns[0])
+                .max(outcome.phase_ns[1]);
             self.stats.publication_ns += outcome.elapsed_ns;
             self.stats.host_peak_bytes = self.stats.host_peak_bytes.max(outcome.peak);
             outcome.result?;

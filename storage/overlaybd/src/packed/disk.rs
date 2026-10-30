@@ -13,6 +13,7 @@ pub const PAGE: usize = 4096;
 pub struct PublicationStats {
     pub barriers: u64,
     pub barrier_ns: u64,
+    pub phase_ns: [u64; 2],
     pub peak: u64,
 }
 fn publish_steps(
@@ -26,7 +27,9 @@ fn publish_steps(
         let started = std::time::Instant::now();
         let result = barrier();
         stats.barriers += 1;
-        stats.barrier_ns += started.elapsed().as_nanos() as u64;
+        let elapsed = started.elapsed().as_nanos() as u64;
+        stats.barrier_ns += elapsed;
+        stats.phase_ns[phase] += elapsed;
         result?;
         if phase == 0 {
             header()?;
@@ -51,6 +54,15 @@ pub trait Disk: Send + Sync {
     }
 }
 pub struct FileDisk(File, std::sync::Mutex<()>);
+impl Drop for FileDisk {
+    fn drop(&mut self) {
+        // The last engine/view reference owns the lock lifetime. A concurrent
+        // fork must not prolong it via a descriptor waiting to be closed at exec.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
 impl FileDisk {
     pub fn open(path: &Path, create: bool) -> Result<Self> {
         let f = OpenOptions::new()
@@ -67,6 +79,12 @@ impl FileDisk {
         ensure!(
             unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "packed backing is already owned: {}",
+            std::io::Error::last_os_error()
+        );
+        #[cfg(target_os = "macos")]
+        ensure!(
+            unsafe { libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1) } == 0,
+            "packed direct I/O hint: {}",
             std::io::Error::last_os_error()
         );
         if create {
@@ -161,6 +179,26 @@ impl FileDisk {
         }
         #[cfg(not(target_os = "macos"))]
         self.0.sync_all()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn closed_owner_does_not_leave_an_inherited_flock() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("upper.packed");
+        let owner = FileDisk::open(&path, true)?;
+        let inherited = owner.0.try_clone()?;
+        assert!(FileDisk::open(&path, false).is_err());
+        drop(owner);
+        let next = FileDisk::open(&path, false)?;
+        drop(inherited);
+        assert!(FileDisk::open(&path, false).is_err());
+        drop(next);
+        FileDisk::open(&path, false)?;
         Ok(())
     }
 }
