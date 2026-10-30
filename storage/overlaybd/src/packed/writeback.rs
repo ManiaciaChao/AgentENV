@@ -120,6 +120,7 @@ impl Writer {
         let thread = thread::Builder::new()
             .name("packed-data".into())
             .spawn(move || {
+                super::scheduling::foreground();
                 while let Ok(job) = rx.recv() {
                     let started = Instant::now();
                     let result = disk.write(job.offset, &job.bytes);

@@ -34,6 +34,7 @@ impl Publisher {
         let thread = thread::Builder::new()
             .name("packed-publish".into())
             .spawn(move || {
+                super::scheduling::foreground();
                 while let Ok(job) = rx.recv() {
                     let started = Instant::now();
                     let mut outcome = Outcome {

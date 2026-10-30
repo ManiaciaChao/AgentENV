@@ -471,6 +471,20 @@ fn fragmented_segment_relocation_preserves_cross_page_objects() -> Result<()> {
         core.stats()?.generations >= before + 2,
         "cleaner did not relocate a victim"
     );
+    // Background work must converge. Low occupancy alone is not evidence
+    // that moving a segment can free another physical page.
+    for _ in 0..32 {
+        core.maintenance()?;
+    }
+    let settled = core.stats()?;
+    for _ in 0..8 {
+        core.maintenance()?;
+    }
+    assert_eq!(core.stats()?.generations, settled.generations);
+    assert_eq!(
+        core.stats()?.cleaner_relocations,
+        settled.cleaner_relocations
+    );
     drop(core);
     disk.cut(0, false);
     let core = Core::open(disk, Policy::default())?;
@@ -798,8 +812,20 @@ fn metadata_cache_collision_and_reuse_never_return_stale_pages() -> Result<()> {
     let mut other = page;
     other[32] = 17;
     tree::seal(&mut other);
-    cache.insert(2050, &other); // Same direct-mapped slot.
+    disk.write(2050 * PAGE as u64, &other)?;
+    cache.insert(2050, &other); // Collides in the same set, but both fit.
     assert_eq!(cache.read(&disk, 2, 3)?, page);
+    assert_eq!((cache.hits, cache.misses), (2, 1));
+    // Fill this set and keep one hot path alive while a ninth node arrives.
+    for i in 1..7 {
+        cache.insert(2 + i * 256, &page);
+    }
+    assert_eq!(cache.read(&disk, 2, 3)?, page);
+    cache.insert(2 + 7 * 256, &other);
+    assert_eq!(cache.read(&disk, 2, 3)?, page);
+    assert_eq!(cache.misses, 1);
+    assert_eq!(cache.read(&disk, 2050, 3)?, other);
+    assert_eq!(cache.misses, 2); // Least recently used entry was evicted.
     disk.write(2 * PAGE as u64, &other)?;
     cache.invalidate(2);
     assert_eq!(cache.read(&disk, 2, 3)?, other);

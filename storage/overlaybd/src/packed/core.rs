@@ -55,6 +55,7 @@ pub struct Stats {
     pub commit_ns: u64,
     pub prepare_ns: u64,
     pub coordinator_qos: u32,
+    pub caller_qos: u32,
     pub objects_and_data_ns: u64,
     pub metadata_ns: u64,
     pub encoding_wait_ns: u64,
@@ -66,6 +67,8 @@ pub struct Stats {
     pub cleaner_pending_bytes: u64,
     pub cleaner_punch_batches: u64,
     pub cleaner_selection_ns: u64,
+    pub cleaner_relocations: u64,
+    pub cleaner_relocated_bytes: u64,
     pub metadata_cache_hits: u64,
     pub metadata_cache_misses: u64,
     pub bookkeeping_ns: u64,
@@ -81,6 +84,16 @@ pub struct Stats {
     pub frontend_wait_ns: u64,
     pub metadata_pages_written: u64,
     pub metadata_write_calls: u64,
+}
+// Occupancy alone is insufficient: a sparse one-page tail cannot shrink.
+// Reserve one page for padding at a destination segment boundary, and demand
+// strictly positive physical-page savings even in that worst case.
+fn cleaner_victim(segments: &Map<(u64, u64)>) -> Option<u64> {
+    segments
+        .iter()
+        .filter(|(_, v)| v.0 * 10 < v.1 * PAGE as u64 * 7 && v.0.div_ceil(PAGE as u64) + 1 < v.1)
+        .min_by_key(|(_, v)| v.0)
+        .map(|(&seg, _)| seg)
 }
 fn object_pages(v: &Value) -> std::ops::RangeInclusive<u64> {
     v[0] / PAGE as u64..=(v[0] + v[1] - 1) / PAGE as u64
@@ -248,7 +261,14 @@ impl Pages for Allocation {
         self.retired.insert(p);
     }
     fn read_page(&mut self, page: u64, level: u8) -> Result<[u8; PAGE]> {
-        self.cache.read(self.disk.as_ref(), page, level)
+        let bytes = self.cache.read(self.disk.as_ref(), page, level)?;
+        // COW traversal retires a node before reading it. No working traversal
+        // will need that physical version again; reader roots use in-memory
+        // mappings, and recovery always validates disk pages independently.
+        if self.retired.contains(&page) {
+            self.cache.invalidate(page);
+        }
+        Ok(bytes)
     }
     fn write_page(&mut self, page: u64, bytes: &[u8; PAGE]) -> Result<()> {
         self.data_page(page, bytes)?;
@@ -383,27 +403,10 @@ impl Allocation {
         // per-object path. Leave less than one batch of holes for metadata/small
         // writes; once enough total space exists, reuse it even if fragmented.
         // Thus this preference cannot accumulate an unbounded free-space tail.
-        let (start, shift_at, shift, count) = if self.free.len() < bytes.len() / PAGE {
-            let pages_per_segment = SEGMENT / PAGE as u64;
-            let (_, _, count) = layout(self.end);
-            if let Some(excluded) = self.excluded {
-                if self.end / pages_per_segment <= excluded
-                    && (self.end + count - 1) / pages_per_segment >= excluded
-                {
-                    self.end = (excluded + 1) * pages_per_segment;
-                }
-            }
-            let start = self.end;
-            let (at, shift, count) = layout(start);
-            if count as usize * PAGE > super::writeback::WRITE_BYTES {
-                return Ok(None);
-            }
-            self.end += count;
-            (start, at, shift, count)
-        } else {
+        let mut found = None;
+        if self.free.len() >= bytes.len() / PAGE {
             let mut run = 0;
             let mut start = 0;
-            let mut found = None;
             for &page in self.free.iter().take(4096) {
                 if self.excluded == Some(page * PAGE as u64 / SEGMENT) {
                     run = 0;
@@ -422,14 +425,41 @@ impl Allocation {
                     }
                 }
             }
-            let Some(found) = found else {
-                return Ok(None);
-            };
+        }
+        let (start, shift_at, shift, count) = if let Some(found) = found {
             for page in found.0..found.0 + found.3 {
                 self.free.remove(&page);
                 self.cache.invalidate(page);
             }
             found
+        } else {
+            if self.free.len() >= bytes.len() / PAGE && self.excluded.is_none() {
+                return Ok(None);
+            }
+            // A cleaner must consolidate into a contiguous destination. Reusing
+            // isolated holes would reproduce the very fragmentation it removes.
+            // At most one segment is relocated per transaction; foreground I/O
+            // still reuses fragmented free pages instead of growing unboundedly.
+            let pages_per_segment = SEGMENT / PAGE as u64;
+            let (_, _, count) = layout(self.end);
+            if let Some(excluded) = self.excluded {
+                if self.end / pages_per_segment <= excluded
+                    && (self.end + count - 1) / pages_per_segment >= excluded
+                {
+                    self.end = (excluded + 1) * pages_per_segment;
+                }
+            }
+            let mut start = self.end;
+            let (mut at, mut shift, mut count) = layout(start);
+            if count as usize * PAGE > super::writeback::WRITE_BYTES {
+                if self.excluded.is_none() {
+                    return Ok(None);
+                }
+                start = start.next_multiple_of(pages_per_segment);
+                (at, shift, count) = layout(start);
+            }
+            self.end = start + count;
+            (start, at, shift, count)
         };
         if shift != 0 {
             bytes.resize(count as usize * PAGE, 0);
@@ -1124,15 +1154,28 @@ impl Core {
                 .filter(|(_, v)| v[0] / SEGMENT == seg)
                 .map(|(&id, _)| id)
                 .collect();
-            for id in ids {
-                let v = next.objects.get_mut(&id).unwrap();
-                {
-                    let mut bytes = vec![0; v[1] as usize];
-                    self.disk.read(v[0], &mut bytes)?;
-                    v[0] = a.payload(&bytes)?;
-                    objects.insert(id, Some(*v));
-                }
+            let mut bytes = Vec::new();
+            let mut spans = Vec::with_capacity(ids.len());
+            for &id in &ids {
+                let v = &next.objects[&id];
+                let at = bytes.len();
+                let len = v[1] as usize;
+                bytes.resize(at + len.next_multiple_of(64), 0);
+                self.disk.read(v[0], &mut bytes[at..at + len])?;
+                spans.push((at, len));
             }
+            let relocated = bytes.len() as u64;
+            bytes.resize(bytes.len().next_multiple_of(PAGE), 0);
+            let run = a
+                .packed_batch(&mut bytes, &spans)?
+                .context("cleaner failed to reserve contiguous destination")?;
+            for (&id, &(at, _)) in ids.iter().zip(&spans) {
+                let v = next.objects.get_mut(&id).unwrap();
+                v[0] = run.at(at);
+                objects.insert(id, Some(*v));
+            }
+            self.stats.cleaner_relocations += 1;
+            self.stats.cleaner_relocated_bytes += relocated;
         }
         a.finish_pack()?;
         a.flush_data()?;
@@ -1202,7 +1245,9 @@ impl Core {
                 continue;
             }
             if let Some(v) = old {
-                let seg = next.segments.get_mut(&(v[0] / SEGMENT))
+                let seg = next
+                    .segments
+                    .get_mut(&(v[0] / SEGMENT))
                     .context("missing packed segment")?;
                 seg.0 -= v[1].next_multiple_of(64);
                 for p in object_pages(v) {
@@ -1437,11 +1482,7 @@ impl Core {
             || (data_bytes > SEGMENT && fragmented * 10 >= data_bytes * 3)
         {
             let selection_started = Instant::now();
-            let victim = self.root().segments
-                .iter()
-                .filter(|(_, v)| v.0 * 10 < v.1 * PAGE as u64 * 7)
-                .min_by_key(|(_, v)| v.0)
-                .map(|(&seg, _)| seg);
+            let victim = cleaner_victim(&self.root().segments);
             self.stats.cleaner_selection_ns += selection_started.elapsed().as_nanos() as u64;
             if let Some(seg) = victim {
                 if should_yield() {
@@ -1591,6 +1632,21 @@ impl Core {
 mod allocation_tests {
     use super::*;
 
+    #[test]
+    fn sparse_tails_do_not_starve_reclaimable_segments() {
+        let mut segments: Map<(u64, u64)> = [
+            (1, (64, 1)),
+            (2, (PAGE as u64 * 12, 32)),
+            (3, (PAGE as u64 + 64, 3)),
+        ]
+        .into_iter()
+        .collect();
+        // The old minimum-live-bytes selector chose segment 1 forever.
+        assert_eq!(cleaner_victim(&segments), Some(2));
+        segments.remove(&2);
+        assert_eq!(cleaner_victim(&segments), None);
+    }
+
     fn check_segments(root: &Root) {
         let mut expected: BTreeMap<u64, (u64, BTreeSet<u64>)> = BTreeMap::new();
         for (_, v) in root.objects.iter() {
@@ -1598,8 +1654,10 @@ mod allocation_tests {
             entry.0 += v[1].next_multiple_of(64);
             entry.1.extend(object_pages(v));
         }
-        let expected: BTreeMap<_, _> = expected.into_iter()
-            .map(|(seg, (bytes, pages))| (seg, (bytes, pages.len() as u64))).collect();
+        let expected: BTreeMap<_, _> = expected
+            .into_iter()
+            .map(|(seg, (bytes, pages))| (seg, (bytes, pages.len() as u64)))
+            .collect();
         let actual: BTreeMap<_, _> = root.segments.iter().map(|(&k, &v)| (k, v)).collect();
         assert_eq!(actual, expected);
     }
@@ -1607,13 +1665,25 @@ mod allocation_tests {
     #[test]
     fn segment_occupancy_tracks_shared_objects_relocation_and_reopen() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let disk = Arc::new(super::super::disk::FileDisk::open(&dir.path().join("pack"), true)?);
+        let disk = Arc::new(super::super::disk::FileDisk::open(
+            &dir.path().join("pack"),
+            true,
+        )?);
         let mut core = Core::create(disk.clone(), 2048 * PAGE as u64, Policy::default())?;
         let mut rng = 17u64;
         for policy in [
-            Policy { compression: Codec::None, dedupe: false },
-            Policy { compression: Codec::Lz4, dedupe: true },
-            Policy { compression: Codec::Zstd, dedupe: false },
+            Policy {
+                compression: Codec::None,
+                dedupe: false,
+            },
+            Policy {
+                compression: Codec::Lz4,
+                dedupe: true,
+            },
+            Policy {
+                compression: Codec::Zstd,
+                dedupe: false,
+            },
         ] {
             core.set_policy(policy)?;
             for lba in 0..2048 {
@@ -1653,9 +1723,18 @@ mod allocation_tests {
     #[test]
     fn pinned_retirement_does_not_trigger_tiny_punch_barriers() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let disk = Arc::new(super::super::disk::FileDisk::open(&dir.path().join("pack"), true)?);
-        let mut core = Core::create(disk, 4096 * PAGE as u64,
-            Policy { compression: Codec::None, dedupe: false })?;
+        let disk = Arc::new(super::super::disk::FileDisk::open(
+            &dir.path().join("pack"),
+            true,
+        )?);
+        let mut core = Core::create(
+            disk,
+            4096 * PAGE as u64,
+            Policy {
+                compression: Codec::None,
+                dedupe: false,
+            },
+        )?;
         for lba in 0..4096 {
             core.stage(lba, Box::new([19; PAGE]))?;
         }
@@ -1758,12 +1837,18 @@ mod allocation_tests {
         disk.read(offset, &mut actual)?;
         assert_eq!(actual, bytes);
         // Reuse a sufficiently large hole; leave isolated holes for fallback.
+        a.excluded = None;
         a.free = [3, 5, 10, 11].into_iter().collect();
         assert_eq!(
             a.packed_batch(&mut bytes.clone(), &[])?.map(|r| r.offset),
             Some(10 * PAGE as u64)
         );
         assert!(a.packed_batch(&mut bytes.clone(), &[])?.is_none());
+        assert_eq!(a.free, [3, 5].into_iter().collect());
+        // Cleaner relocation instead uses a contiguous destination, retaining
+        // isolated holes for foreground writes. It must not recreate sparse pages.
+        a.excluded = Some(8);
+        assert!(a.packed_batch(&mut bytes.clone(), &[])?.is_some());
         assert_eq!(a.free, [3, 5].into_iter().collect());
         a.flush_data()?;
         a.finish_io()?;

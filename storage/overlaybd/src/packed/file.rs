@@ -79,6 +79,7 @@ struct Shared {
     front: Arc<Mutex<Front>>,
     notify: Arc<Notify>,
     budget: Arc<super::buffer::Budget>,
+    caller_qos: std::sync::atomic::AtomicU32,
     stage_ns: std::sync::atomic::AtomicU64,
     wait_ns: std::sync::atomic::AtomicU64,
     lower: Option<Arc<LSMTReadOnlyFile>>,
@@ -204,6 +205,7 @@ impl PackedUpper {
         let worker = thread::Builder::new()
             .name("packed-commit".into())
             .spawn(move || {
+                super::scheduling::foreground();
                 let mut immediate = false;
                 let mut publication_boundary = 0;
                 let mut last_commit = std::time::Instant::now();
@@ -371,6 +373,7 @@ impl PackedUpper {
             thread::Builder::new()
                 .name("packed-prepare".into())
                 .spawn(move || {
+                    super::scheduling::foreground();
                     while prefetch_rx.recv().is_ok() {
                         if preparing.load(std::sync::atomic::Ordering::Acquire) {
                             break;
@@ -403,6 +406,7 @@ impl PackedUpper {
             front,
             notify,
             budget,
+            caller_qos: std::sync::atomic::AtomicU32::new(0),
             stage_ns: std::sync::atomic::AtomicU64::new(0),
             wait_ns: std::sync::atomic::AtomicU64::new(0),
             lower,
@@ -521,6 +525,12 @@ impl PackedUpper {
     // lease still serializes overlaps. Short locks reserve capacity and publish
     // mappings, with the immutable copy prepared between them.
     async fn stage_aligned(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
+        if self.0.caller_qos.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            self.0.caller_qos.store(
+                super::scheduling::current(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         loop {
             let notified = self.0.notify.notified();
             tokio::pin!(notified);
@@ -710,6 +720,7 @@ impl PackedUpper {
             stats.plaintext_buffer_bytes = self.0.budget.used();
             stats.frontend_stage_ns = self.0.stage_ns.load(std::sync::atomic::Ordering::Relaxed);
             stats.frontend_wait_ns = self.0.wait_ns.load(std::sync::atomic::Ordering::Relaxed);
+            stats.caller_qos = self.0.caller_qos.load(std::sync::atomic::Ordering::Relaxed);
             Ok(stats)
         }
     }

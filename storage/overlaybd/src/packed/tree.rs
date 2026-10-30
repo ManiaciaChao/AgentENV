@@ -43,20 +43,36 @@ fn read(d: &dyn Disk, p: u64, level: u8) -> Result<[u8; PAGE]> {
     );
     Ok(b)
 }
-// Bounded, direct-mapped cache of immutable, validated metadata pages. It is
-// owned only by the commit coordinator and never substitutes for recovery reads.
+// Bounded, eight-way cache of immutable, validated metadata pages. Physical
+// allocation strides must not evict hot tree paths on each COW publication.
+// Retired tags are invalidated while their buffers remain available for reuse.
+struct CachedPage {
+    page: Option<u64>,
+    bytes: Box<[u8; PAGE]>,
+    touched: u64,
+}
 #[derive(Default)]
 pub(super) struct Cache {
-    slots: Vec<Option<(u64, Box<[u8; PAGE]>)>>,
+    slots: Vec<Option<CachedPage>>,
+    clock: u64,
     pub hits: u64,
     pub misses: u64,
 }
 impl Cache {
-    const SLOTS: usize = 2048; // At most 8 MiB of metadata, separate from dirty data.
+    const SLOTS: usize = 2048; // At most 8 MiB, separate from plaintext buffers.
+    const WAYS: usize = 8;
+    fn set(page: u64) -> std::ops::Range<usize> {
+        let start = page as usize % (Self::SLOTS / Self::WAYS) * Self::WAYS;
+        start..start + Self::WAYS
+    }
     pub fn invalidate(&mut self, page: u64) {
-        if let Some(slot) = self.slots.get_mut(page as usize % Self::SLOTS) {
-            if slot.as_ref().is_some_and(|(key, _)| *key == page) {
-                *slot = None;
+        if self.slots.is_empty() {
+            return;
+        }
+        for entry in self.slots[Self::set(page)].iter_mut().flatten() {
+            if entry.page == Some(page) {
+                entry.page = None;
+                entry.touched = 0;
             }
         }
     }
@@ -64,20 +80,44 @@ impl Cache {
         if self.slots.is_empty() {
             self.slots.resize_with(Self::SLOTS, || None);
         }
-        let slot = &mut self.slots[page as usize % Self::SLOTS];
-        if let Some((key, data)) = slot {
-            *key = page;
-            data.copy_from_slice(bytes);
+        self.clock = self.clock.saturating_add(1);
+        let set = &mut self.slots[Self::set(page)];
+        let index = set
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|e| e.page == Some(page)))
+            .or_else(|| {
+                set.iter()
+                    .position(|s| s.as_ref().is_none_or(|e| e.page.is_none()))
+            })
+            .unwrap_or_else(|| {
+                set.iter()
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.as_ref().unwrap().touched)
+                    .unwrap()
+                    .0
+            });
+        if let Some(entry) = &mut set[index] {
+            entry.page = Some(page);
+            entry.bytes.copy_from_slice(bytes);
+            entry.touched = self.clock;
         } else {
-            *slot = Some((page, Box::new(*bytes)));
+            set[index] = Some(CachedPage {
+                page: Some(page),
+                bytes: Box::new(*bytes),
+                touched: self.clock,
+            });
         }
     }
     pub fn read(&mut self, disk: &dyn Disk, page: u64, level: u8) -> Result<[u8; PAGE]> {
-        if let Some(Some((key, bytes))) = self.slots.get(page as usize % Self::SLOTS) {
-            if *key == page {
-                ensure!(bytes[8] == level, "packed cached tree level mismatch");
-                self.hits += 1;
-                return Ok(**bytes);
+        if !self.slots.is_empty() {
+            for entry in self.slots[Self::set(page)].iter_mut().flatten() {
+                if entry.page == Some(page) {
+                    ensure!(entry.bytes[8] == level, "packed cached tree level mismatch");
+                    self.clock = self.clock.saturating_add(1);
+                    entry.touched = self.clock;
+                    self.hits += 1;
+                    return Ok(*entry.bytes);
+                }
             }
         }
         self.misses += 1;

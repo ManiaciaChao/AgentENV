@@ -216,15 +216,20 @@ impl SharedPool {
             pool.workers.push(
                 thread::Builder::new()
                     .name(format!("packed-encode-{i}"))
-                    .spawn(move || loop {
-                        let job = jobs.recv();
-                        match job {
-                            Some(job) => {
-                                let _ =
-                                    job.result
-                                        .send(prepare(job.input, job.policy, Some(&buffers)));
+                    .spawn(move || {
+                        super::scheduling::foreground();
+                        loop {
+                            let job = jobs.recv();
+                            match job {
+                                Some(job) => {
+                                    let _ = job.result.send(prepare(
+                                        job.input,
+                                        job.policy,
+                                        Some(&buffers),
+                                    ));
+                                }
+                                None => break,
                             }
-                            None => break,
                         }
                     })?,
             );
