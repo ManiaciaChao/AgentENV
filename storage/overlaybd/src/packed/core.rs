@@ -52,6 +52,7 @@ pub struct Stats {
     pub prefetched_batches: u64,
     pub packed_batches: u64,
     pub fragmented_batches: u64,
+    pub fragment_append_batches: u64,
     pub writeback_ns: u64,
     pub barriers: u64,
     pub barrier_ns: u64,
@@ -249,6 +250,8 @@ impl Root {
 struct Allocation {
     disk: Arc<dyn Disk>,
     free: BTreeSet<u64>,
+    fragment_budget: u64,
+    fragment_appends: u64,
     end: u64,
     // The open packing page is the last page of output, never a separate copy.
     pack: Option<(u64, usize)>,
@@ -418,10 +421,8 @@ impl Allocation {
             let count = (content_end + shift).div_ceil(PAGE) as u64;
             (shift_at, shift, count)
         };
-        // A few tiny holes should not force an entire large batch through the
-        // per-object path. Leave less than one batch of holes for metadata/small
-        // writes; once enough total space exists, reuse it even if fragmented.
-        // Thus this preference cannot accumulate an unbounded free-space tail.
+        // First prefer a complete free run. If none exists, the fallback below
+        // bounds how much fragmented space can be deferred for small writes.
         let mut found = None;
         if self.free.len() >= bytes.len() / PAGE {
             let mut run = 0;
@@ -453,7 +454,15 @@ impl Allocation {
             found
         } else {
             if self.free.len() >= bytes.len() / PAGE && self.excluded.is_none() {
-                return Ok(None);
+                // Bulk payloads should not turn into thousands of page writes
+                // merely because retired tree nodes left small isolated holes.
+                // Reserve a bounded amount for metadata/small writes. The cap
+                // derives from live bytes, never file length, so overwrites
+                // cannot ratchet the reserve upward as the file grows.
+                if bytes.len() < 128 * 1024 || self.free.len() as u64 >= self.fragment_budget {
+                    return Ok(None);
+                }
+                self.fragment_appends += 1;
             }
             // A cleaner must consolidate into a contiguous destination. Reusing
             // isolated holes would reproduce the very fragmentation it removes.
@@ -1127,6 +1136,9 @@ impl Core {
         let mut a = Allocation {
             disk: self.disk.clone(),
             free,
+            fragment_budget: (self.root().aligned_bytes / PAGE as u64 / 16)
+                .min(8 * 1024 * 1024 / PAGE as u64),
+            fragment_appends: 0,
             end,
             pack: None,
             metadata: 0,
@@ -1418,6 +1430,7 @@ impl Core {
         self.stats.metadata_pages_written += a.metadata;
         self.stats.data_write_calls += data_write_calls;
         self.stats.data_write_bytes += data_write_bytes;
+        self.stats.fragment_append_batches += a.fragment_appends;
         self.working_blocks += pending.len() as u64;
         if let Some(old) = self.working.take() {
             self.readers.push(Arc::downgrade(&old));
@@ -1912,6 +1925,8 @@ mod allocation_tests {
         let mut a = Allocation {
             disk: disk.clone(),
             free: (2..1024).filter(|p| p % 7 != 0).collect(),
+            fragment_budget: 0,
+            fragment_appends: 0,
             end: 1024,
             pack: None,
             metadata: 0,
@@ -2015,6 +2030,42 @@ mod allocation_tests {
                 assert_eq!(actual, vec![i as u8 + 11; len]);
             }
         }
+        // Bulk writes may leave a bounded reserve of isolated holes, but must
+        // still reuse a full run, small holes for small writes, and holes at the
+        // reserve limit. Keep a neighbouring allocated page unchanged.
+        a.end = 12 * SEGMENT / PAGE as u64;
+        a.excluded = None;
+        a.free = (2..514).step_by(2).collect();
+        a.fragment_budget = 512;
+        let start = a.end;
+        disk.write((start - 1) * PAGE as u64, &[77; PAGE])?;
+        let large = vec![53; 256 * PAGE];
+        let calls = a.write_calls;
+        let run = a.packed_batch(&mut large.clone(), &[])?.unwrap();
+        assert_eq!(run.offset, start * PAGE as u64);
+        assert_eq!(a.write_calls - calls, 1);
+        assert_eq!(a.fragment_appends, 1);
+        assert_eq!(a.free.len(), 256);
+        a.finish_io()?;
+        let mut actual = vec![0; large.len()];
+        disk.read(run.offset, &mut actual)?;
+        assert_eq!(actual, large);
+        let mut sentinel = [0; PAGE];
+        disk.read((start - 1) * PAGE as u64, &mut sentinel)?;
+        assert_eq!(sentinel, [77; PAGE]);
+        let end = a.end;
+        a.fragment_budget = 256;
+        assert!(a.packed_batch(&mut large.clone(), &[])?.is_none());
+        assert_eq!(a.end, end);
+        a.fragment_budget = 512;
+        assert!(a.packed_batch(&mut vec![1; 16 * PAGE], &[])?.is_none());
+        a.free = (400..656).collect();
+        assert_eq!(
+            a.packed_batch(&mut large.clone(), &[])?.unwrap().offset,
+            400 * PAGE as u64
+        );
+        assert_eq!(a.end, end);
+        a.finish_io()?;
         Ok(())
     }
 }
