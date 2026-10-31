@@ -10,6 +10,7 @@ use std::{
 
 #[derive(Default)]
 pub(super) struct ReadCache {
+    pub hot: super::hot::Cache,
     buffers: Mutex<std::collections::BTreeMap<u64, Arc<Vec<u8>>>>,
     high_water: std::sync::atomic::AtomicU64,
     read_blocks: std::sync::atomic::AtomicU64,
