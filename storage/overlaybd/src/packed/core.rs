@@ -13,6 +13,9 @@ use std::{
 };
 pub const SEGMENT: u64 = 2 * 1024 * 1024;
 pub const DIRTY_LIMIT: usize = 16 * 1024 * 1024;
+fn fragment_reserve_pages(live_aligned_bytes: u64) -> u64 {
+    (live_aligned_bytes / PAGE as u64 / 16).min(32 * 1024 * 1024 / PAGE as u64)
+}
 pub(super) const READ_BLOCKS: usize = 256;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ReadMask(pub [u64; READ_BLOCKS / 64]);
@@ -53,6 +56,7 @@ pub struct Stats {
     pub packed_batches: u64,
     pub fragmented_batches: u64,
     pub fragment_append_batches: u64,
+    pub fragment_reserve_bytes: u64,
     pub writeback_ns: u64,
     pub barriers: u64,
     pub barrier_ns: u64,
@@ -1107,8 +1111,7 @@ impl Core {
         let mut a = Allocation {
             disk: self.disk.clone(),
             free,
-            fragment_budget: (self.root().aligned_bytes / PAGE as u64 / 16)
-                .min(8 * 1024 * 1024 / PAGE as u64),
+            fragment_budget: fragment_reserve_pages(self.root().aligned_bytes),
             fragment_appends: 0,
             end,
             pack: None,
@@ -1723,6 +1726,7 @@ impl Core {
         s.dirty_bytes = self.pending.len() * PAGE;
         self.view().read_statistics(&mut s);
         s.live_encoded_bytes = self.root().encoded_bytes;
+        s.fragment_reserve_bytes = fragment_reserve_pages(self.root().aligned_bytes) * PAGE as u64;
         let protected = self.protected();
         s.cleaner_pending_bytes = self
             .punching
