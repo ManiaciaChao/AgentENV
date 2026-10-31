@@ -98,6 +98,8 @@ pub struct Stats {
     pub upper_read_blocks: u64,
     pub host_read_calls: u64,
     pub host_read_bytes: u64,
+    pub host_writeback_syncs: u64,
+    pub host_writeback_sync_ns: u64,
 }
 // Occupancy alone is insufficient: a sparse one-page tail cannot shrink.
 // Reserve one page for padding at a destination segment boundary, and demand
@@ -649,6 +651,8 @@ impl ReadView {
         stats.upper_read_blocks = blocks;
         stats.host_read_calls = calls;
         stats.host_read_bytes = bytes;
+        (stats.host_writeback_syncs, stats.host_writeback_sync_ns) =
+            self.disk.writeback_statistics();
     }
     fn decode(&self, v: &Value) -> Result<Box<[u8; PAGE]>> {
         self.writes.count_read_blocks(1);
