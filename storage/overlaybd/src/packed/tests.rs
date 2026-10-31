@@ -248,10 +248,16 @@ async fn lower_rmw_discard_and_standard_export_interoperate() -> Result<()> {
     let lower = Arc::new(LSMTReadOnlyFile::open(sealed).await?);
     let upperpath = dir.path().join("upper.packed");
     PackedUpper::create(&upperpath, size as u64, Policy::default())?;
-    let upper = PackedUpper::open(&upperpath, Some(lower), Policy::default()).await?;
+    let mut upper = PackedUpper::open(&upperpath, Some(lower.clone()), Policy::default()).await?;
     let mut reference = vec![7; size];
     let mut seed = 32u64;
     for i in 0..120 {
+        if i % 30 == 0 {
+            // The live adapter must drain the old policy's generation, not just
+            // change Core's codec between already committed batches.
+            let codec = [Codec::None, Codec::Zstd, Codec::Lz4, Codec::None][i / 30];
+            upper.set_policy(policy(codec, i < 60)).await?;
+        }
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         let offset = (seed as usize) % (size - 8192);
         let len = (seed.rotate_left(19) as usize) % 8192 + 1;
@@ -265,6 +271,15 @@ async fn lower_rmw_discard_and_standard_export_interoperate() -> Result<()> {
         }
         if i % 10 == 0 {
             upper.sync().await?;
+            assert_eq!(upper.read_at(0, size).await?.as_ref(), reference);
+        }
+        if i % 40 == 39 {
+            upper.sync().await?;
+            drop(upper);
+            // Another owner's write policy cannot restrict decoding of any
+            // existing codec or shared object, including explicit zero masks.
+            upper = PackedUpper::open(&upperpath, Some(lower.clone()), policy(Codec::None, false))
+                .await?;
             assert_eq!(upper.read_at(0, size).await?.as_ref(), reference);
         }
     }

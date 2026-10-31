@@ -319,7 +319,11 @@ impl ImageFile {
         let mut state = self.state.write().await;
         if let ImageFileBase::Packed(current) = &state.base {
             let exported = Self::export_packed_path(current, output_layer_path).await?;
-            state.base = ImageFileBase::ReadOnly(LSMTReadOnlyFile::open(exported).await?);
+            // Sealing exports only the upper. The live read-only view must
+            // still resolve untouched ranges through its existing lower stack.
+            let mut lowers = current.lower_files_bottom_to_top();
+            lowers.push(exported);
+            state.base = ImageFileBase::ReadOnly(crate::lsmt::file::open_files_ro(&lowers).await?);
             return Ok(None);
         }
         ensure_sealable_upper(&state.config.upper, "close_seal")?;
@@ -1373,6 +1377,47 @@ mod tests {
         child.write_at(0, &[4; 512]).await?;
         child.sync().await?;
         assert_eq!(reopened.read_at(0, 8192).await?.as_ref(), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packed_close_seal_preserves_lower_stack_and_upper_only_export() -> Result<()> {
+        let dir = TempDir::new()?;
+        let data = dir.path().join("upper.packed");
+        let size = 3 * 4096;
+        PackedUpper::create(&data, size, crate::packed::Policy::default())?;
+        let image = ImageFile::open_packed(
+            ImageConfig {
+                upper: UpperConfig {
+                    data: data.display().to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            build_service(&dir).await,
+            crate::packed::Policy::default(),
+        )
+        .await?;
+        image.write_at(0, &[1; 3 * 4096]).await?;
+        image
+            .create_snapshot_and_restack(&dir.path().join("base"))
+            .await?;
+        image.write_at(4096, &[2; 4096]).await?;
+        image
+            .create_snapshot_and_restack(&dir.path().join("middle"))
+            .await?;
+        image.write_at(8192, &[3; 4096]).await?;
+        let expected = [vec![1; 4096], vec![2; 4096], vec![3; 4096]].concat();
+        let output = dir.path().join("sealed-upper");
+        image.close_seal(&output).await?;
+        assert_eq!(image.read_at(0, size as usize).await?.as_ref(), expected);
+        assert!(image.write_at(0, &[9; 512]).await.is_err());
+        // Exchange still exports only the upper, not a flattened image.
+        let layer = LSMTReadOnlyFile::open(Arc::new(LocalFile::open_rw(&output, false)?)).await?;
+        assert_eq!(
+            layer.read_at(0, size as usize).await?.as_ref(),
+            [vec![0; 8192], vec![3; 4096]].concat()
+        );
         Ok(())
     }
 
