@@ -99,9 +99,6 @@ pub struct Stats {
     pub upper_read_blocks: u64,
     pub host_read_calls: u64,
     pub host_read_bytes: u64,
-    pub hot_read_hits: u64,
-    pub hot_read_misses: u64,
-    pub hot_read_bytes: u64,
     pub host_writeback_syncs: u64,
     pub host_writeback_sync_ns: u64,
 }
@@ -575,17 +572,9 @@ impl ReadView {
         let result = (|| match self.root.map.get(&lba) {
             None => Ok(None),
             Some(v) if *v == 0 => Ok(Some(Box::new([0; PAGE]))),
-            Some(id) => {
-                let value = self.root.objects.get(id).context("missing packed object")?;
-                let mut out = Box::new([0; PAGE]);
-                if self.writes.hot.get(*id, out.as_mut_slice()) {
-                    self.writes.count_read_blocks(1);
-                } else {
-                    self.decode_to(value, out.as_mut_slice())?;
-                    self.writes.hot.insert(*id, out.as_slice());
-                }
-                Ok(Some(out))
-            }
+            Some(v) => Ok(Some(
+                self.decode(self.root.objects.get(v).context("missing packed object")?)?,
+            )),
         })();
         if let Err(e) = &result {
             self.fail(e);
@@ -603,8 +592,6 @@ impl ReadView {
         );
         let result = (|| {
             let mut covered = skip;
-            let cacheable = dst.len() <= super::hot::MAX_REQUEST;
-            let mut data_blocks = 0;
             let mut entries = Vec::with_capacity(dst.len() / PAGE);
             for i in 0..dst.len() / PAGE {
                 if skip.contains(i) {
@@ -617,10 +604,6 @@ impl ReadView {
                 if id == 0 {
                     dst[i * PAGE..(i + 1) * PAGE].fill(0);
                 } else {
-                    data_blocks += 1;
-                    if cacheable && self.writes.hot.get(id, &mut dst[i * PAGE..(i + 1) * PAGE]) {
-                        continue;
-                    }
                     entries.push((
                         i,
                         *self
@@ -628,13 +611,12 @@ impl ReadView {
                             .objects
                             .get(&id)
                             .context("missing packed object")?,
-                        id,
                     ));
                 }
             }
             let count = entries.len();
-            self.writes.count_read_blocks(data_blocks);
-            entries.sort_unstable_by_key(|(_, value, _)| value[0]);
+            self.writes.count_read_blocks(count);
+            entries.sort_unstable_by_key(|(_, value)| value[0]);
             let mut stored = Vec::new();
             let mut first = 0;
             while first < count {
@@ -656,16 +638,13 @@ impl ReadView {
                 stored.reserve_exact(bytes.saturating_sub(stored.len()));
                 stored.resize(bytes, 0);
                 self.writes.read(self.disk.as_ref(), start, &mut stored)?;
-                for &(i, v, id) in &entries[first..last] {
+                for &(i, v) in &entries[first..last] {
                     let at = (v[0] - start) as usize;
                     decode_into(
                         &v,
                         &stored[at..at + v[1] as usize],
                         &mut dst[i * PAGE..(i + 1) * PAGE],
                     )?;
-                    if cacheable {
-                        self.writes.hot.insert(id, &dst[i * PAGE..(i + 1) * PAGE]);
-                    }
                 }
                 first = last;
             }
@@ -681,24 +660,16 @@ impl ReadView {
         stats.upper_read_blocks = blocks;
         stats.host_read_calls = calls;
         stats.host_read_bytes = bytes;
-        (
-            stats.hot_read_hits,
-            stats.hot_read_misses,
-            stats.hot_read_bytes,
-        ) = self.writes.hot.statistics();
         (stats.host_writeback_syncs, stats.host_writeback_sync_ns) =
             self.disk.writeback_statistics();
     }
     fn decode(&self, v: &Value) -> Result<Box<[u8; PAGE]>> {
-        let mut out = Box::new([0; PAGE]);
-        self.decode_to(v, out.as_mut_slice())?;
-        Ok(out)
-    }
-    fn decode_to(&self, v: &Value, out: &mut [u8]) -> Result<()> {
         self.writes.count_read_blocks(1);
         let mut stored = vec![0; v[1] as usize];
         self.writes.read(self.disk.as_ref(), v[0], &mut stored)?;
-        decode_into(v, &stored, out)
+        let mut out = Box::new([0; PAGE]);
+        decode_into(v, &stored, out.as_mut_slice())?;
+        Ok(out)
     }
 }
 fn decode_into(v: &Value, stored: &[u8], out: &mut [u8]) -> Result<()> {

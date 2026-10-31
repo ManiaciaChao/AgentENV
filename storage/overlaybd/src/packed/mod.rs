@@ -19,6 +19,5 @@ mod cleaner;
 mod writeback;
 
 mod buffer;
-mod hot;
 
 mod scheduling;
