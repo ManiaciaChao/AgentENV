@@ -1,8 +1,5 @@
 //! Bounded parallel preparation; workers never mutate mappings or publish roots.
-use super::{
-    core::{Codec, Policy, DIRTY_LIMIT},
-    disk::PAGE,
-};
+use super::{core::DIRTY_LIMIT, disk::PAGE, Codec, Policy};
 use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, sync::Arc, thread};
