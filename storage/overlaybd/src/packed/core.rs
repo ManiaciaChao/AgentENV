@@ -456,7 +456,7 @@ impl Allocation {
                 // Reserve a bounded amount for metadata/small writes. The cap
                 // derives from live bytes, never file length, so overwrites
                 // cannot ratchet the reserve upward as the file grows.
-                if bytes.len() < 128 * 1024 || self.free.len() as u64 >= self.fragment_budget {
+                if self.free.len() as u64 >= self.fragment_budget {
                     return Ok(None);
                 }
                 self.fragment_appends += 1;
@@ -2002,7 +2002,7 @@ mod allocation_tests {
             }
         }
         // Bulk writes may leave a bounded reserve of isolated holes, but must
-        // still reuse a full run, small holes for small writes, and holes at the
+        // still reuse a full run, single-page holes, and holes at the
         // reserve limit. Keep a neighbouring allocated page unchanged.
         a.end = 12 * SEGMENT / PAGE as u64;
         a.excluded = None;
@@ -2029,7 +2029,17 @@ mod allocation_tests {
         assert!(a.packed_batch(&mut large.clone(), &[])?.is_none());
         assert_eq!(a.end, end);
         a.fragment_budget = 512;
-        assert!(a.packed_batch(&mut vec![1; 16 * PAGE], &[])?.is_none());
+        assert_eq!(
+            a.packed_batch(&mut vec![1; PAGE], &[])?.unwrap().offset,
+            2 * PAGE as u64
+        );
+        assert_eq!(a.end, end);
+        // Compression can make a large logical batch much smaller than 128 KiB.
+        // Preserve batching even then, without increasing the fragment reserve.
+        let small = a.packed_batch(&mut vec![2; 16 * PAGE], &[])?.unwrap();
+        assert_eq!(small.offset, end * PAGE as u64);
+        assert_eq!(a.free.len(), 255);
+        let end = a.end;
         a.free = (400..656).collect();
         assert_eq!(
             a.packed_batch(&mut large.clone(), &[])?.unwrap().offset,
