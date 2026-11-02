@@ -302,3 +302,47 @@ fn packed_payloads_cross_pages_and_output_batches_without_rewriting_closed_pages
     a.finish_io()?;
     Ok(())
 }
+
+#[test]
+fn cleaner_relocation_bounds_mixed_object_buffer_capacity() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let disk = Arc::new(super::super::disk::FileDisk::open(
+        &dir.path().join("pack"),
+        true,
+    )?);
+    let policy = Policy {
+        compression: Codec::Lz4,
+        dedupe: false,
+    };
+    let mut core = Core::create(disk.clone(), 1536 * PAGE as u64, policy)?;
+    let mut rng = 43u64;
+    let mut expected = Vec::new();
+    for lba in 0..1536 {
+        let mut block = Box::new([0; PAGE]);
+        for byte in &mut block[..2073 + (lba as usize % 17) * 7] {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            *byte = rng as u8;
+        }
+        expected.push(block.clone());
+        core.stage(lba, block)?;
+    }
+    core.commit()?;
+    for lba in (0..1536).step_by(3) {
+        expected[lba] = Box::new([0; PAGE]);
+        core.stage(lba as u64, expected[lba].clone())?;
+    }
+    core.commit()?;
+    let victim = *core.root().segments.iter().next().unwrap().0;
+    core.publish(true, Some(victim))?;
+    drop(core);
+    let reopened = Core::open(disk, policy)?;
+    for (lba, block) in expected.iter().enumerate() {
+        assert_eq!(
+            reopened.view().read(lba as u64)?.unwrap().as_slice(),
+            block.as_slice()
+        );
+    }
+    Ok(())
+}

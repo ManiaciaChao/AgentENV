@@ -328,7 +328,10 @@ impl Core {
                 .filter(|(_, v)| v[0] / SEGMENT == seg)
                 .map(|(&id, _)| id)
                 .collect();
-            let mut bytes = Vec::new();
+            // A victim contains at most one segment of payload. Reserve that
+            // bound before appending mixed object sizes so Vec's geometric
+            // growth cannot exceed the writer's allocation limit.
+            let mut bytes = Vec::with_capacity(super::super::writeback::WRITE_BYTES);
             let mut spans = Vec::with_capacity(ids.len());
             for &id in &ids {
                 let v = &next.objects[&id];
