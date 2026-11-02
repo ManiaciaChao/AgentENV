@@ -13,7 +13,7 @@ use crate::lsmt::file::{
 };
 use crate::packed::PackedUpper;
 use crate::prefetch::{new_prefetcher, PrefetchMode, Prefetcher};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
@@ -274,6 +274,44 @@ impl ImageFile {
             ImageFileBase::ReadWrite(file) => file.get_uuid(layer_idx),
             ImageFileBase::Packed(file) => file.get_uuid(layer_idx),
         }
+    }
+
+    /// Count mapped, non-zero-mask sectors in a range without reading payloads.
+    /// Used to overlay a caller's plaintext cache for non-mutating statistics.
+    pub async fn mapped_data_bytes_in_range(&self, offset: u64, len: u64) -> Result<u64> {
+        let end = offset.checked_add(len).context("mapped range overflow")?;
+        ensure!(
+            offset.is_multiple_of(512) && len.is_multiple_of(512) && end <= self.size_bytes(),
+            "invalid mapped range"
+        );
+        let state = self.state.read().await;
+        let mut ranges = Vec::new();
+        match &state.base {
+            ImageFileBase::ReadOnly(file) => {
+                file.seek_data(offset, end, &mut ranges)?;
+            }
+            ImageFileBase::ReadWrite(file) => {
+                file.seek_data(offset, end, &mut ranges).await?;
+            }
+            ImageFileBase::Packed(file) => {
+                let mut cursor = offset;
+                let mut bytes = 0;
+                while cursor < end {
+                    let Some(data) = file.seek_data(cursor).await? else {
+                        break;
+                    };
+                    if data >= end {
+                        break;
+                    }
+                    let hole = file.seek_hole(data).await?.unwrap_or(end).min(end);
+                    ensure!(hole > data, "non-progressing packed extent");
+                    bytes += hole - data;
+                    cursor = hole;
+                }
+                return Ok(bytes);
+            }
+        }
+        Ok(ranges.iter().map(|r| r.length as u64 * 512).sum())
     }
 
     pub async fn compact(&self, as_file: Arc<dyn VirtualFile>) -> Result<()> {

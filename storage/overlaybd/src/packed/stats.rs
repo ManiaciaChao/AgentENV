@@ -43,6 +43,8 @@ pub struct Stats {
     pub data_write_calls: u64,
     pub data_write_bytes: u64,
     pub live_encoded_bytes: u64,
+    /// Plaintext size of live unique objects, before compression and after dedupe.
+    pub unique_plaintext_bytes: u64,
     pub retired_bytes: u64,
     pub reclaimable_bytes: u64,
     pub reclaimed_bytes: u64,

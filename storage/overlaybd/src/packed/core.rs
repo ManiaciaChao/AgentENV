@@ -368,6 +368,7 @@ impl Core {
         s.dirty_bytes = self.pending.len() * PAGE;
         self.view().read_statistics(&mut s);
         s.live_encoded_bytes = self.root().encoded_bytes;
+        s.unique_plaintext_bytes = self.root().objects.len() as u64 * PAGE as u64;
         s.fragment_reserve_bytes = fragment_reserve_pages(self.root().aligned_bytes) * PAGE as u64;
         let protected = self.protected();
         s.cleaner_pending_bytes = self

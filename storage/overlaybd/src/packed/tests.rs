@@ -117,12 +117,15 @@ fn policy_changes_preserve_mixed_objects_and_zero_masks() -> Result<()> {
         c.commit()?;
     }
     assert_eq!(c.stats()?.dedupe_hits, 3);
+    assert_eq!(c.stats()?.unique_plaintext_bytes, 3 * PAGE as u64);
+    assert!(c.stats()?.live_encoded_bytes < c.stats()?.unique_plaintext_bytes);
     c.set_policy(policy(Codec::None, false))?;
     c.stage(8, Box::new([0; PAGE]))?;
     c.commit()?;
     drop(c);
     d.cut(0, false);
     let c = Core::open(d, Policy::default())?;
+    assert_eq!(c.stats()?.unique_plaintext_bytes, 3 * PAGE as u64);
     for i in 0..3 {
         assert_eq!(c.read_block(i)?.unwrap().as_slice(), &[i as u8 + 1; PAGE]);
     }
